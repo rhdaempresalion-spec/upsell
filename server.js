@@ -477,22 +477,35 @@ app.get('/api/products', (req, res) => {
 app.get('/api/logs', (req, res) => res.json(systemLogs.slice(0, parseInt(req.query.limit)||100)));
 app.get('/api/validate-phone/:phone', (req, res) => res.json(validatePhoneBR(req.params.phone)));
 
-// CRM — SÓ MANUAL
-app.post('/api/crm/send/:id', async (req, res) => {
+// CRM — SÓ MANUAL (aceita rota nova E antiga)
+async function handleSend(req, res) {
   const tx = txCache.data.find(t => t.id === req.params.id);
   if (!tx) return res.status(404).json({ error: 'Não encontrada' });
   res.json({ success: await sendLeadToCRM(tx) });
-});
-app.post('/api/crm/resend/:id', async (req, res) => {
+}
+async function handleResend(req, res) {
   const tx = txCache.data.find(t => t.id === req.params.id);
   if (!tx) return res.status(404).json({ error: 'Não encontrada' });
   delete leadsSent[tx.id];
   res.json({ success: await sendLeadToCRM(tx) });
-});
+}
+app.post('/api/crm/send/:id', handleSend);
+app.post('/api/crm/resend/:id', handleResend);
+// Aliases para compatibilidade com dashboard antigo
+app.post('/api/transactions/:id/send-crm', handleSend);
+app.post('/api/transactions/:id/resend-crm', handleResend);
 app.post('/api/crm/send-all', async (req, res) => {
   const paid = txCache.data.filter(t => t.status === 'paid' && !leadsSent[t.id]);
   if (!paid.length) return res.json({ success: true, sent: 0, total: 0 });
   addLog('info', `Enviando ${paid.length} leads em lote...`);
+  let sent = 0;
+  for (const tx of paid) { if (await sendLeadToCRM(tx)) sent++; await delay(300); }
+  res.json({ success: true, sent, total: paid.length });
+});
+// Alias antigo
+app.post('/api/transactions/send-all', async (req, res) => {
+  const paid = txCache.data.filter(t => t.status === 'paid' && !leadsSent[t.id]);
+  if (!paid.length) return res.json({ success: true, sent: 0, total: 0 });
   let sent = 0;
   for (const tx of paid) { if (await sendLeadToCRM(tx)) sent++; await delay(300); }
   res.json({ success: true, sent, total: paid.length });
@@ -517,6 +530,16 @@ app.post('/api/crm/test', async (req, res) => {
     res.json({ success: r.ok, status: r.status });
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
+// Alias antigo
+app.post('/api/test-crm', async (req, res) => {
+  try {
+    const r = await fetch(CONFIG.CRM_WEBHOOK_URL, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event: 'test', lead: { nome: 'Teste' }, transacao: { id: 'test_'+Date.now(), valor: 0 } }),
+    });
+    res.json({ success: r.ok, status: r.status });
+  } catch (e) { res.json({ success: false, error: e.message }); }
+});
 app.post('/api/settings/auto-send', (req, res) => {
   CONFIG.AUTO_SEND_CRM = req.body.enabled === true;
   addLog('info', `Auto-send CRM: ${CONFIG.AUTO_SEND_CRM ? 'LIGADO' : 'DESLIGADO'}`);
@@ -526,6 +549,10 @@ app.post('/api/refresh', async (req, res) => {
   await fetchNewTransactions();
   res.json({ success: true, transactions: txCache.data.length });
 });
+// Aliases para compatibilidade com dashboard antigo
+app.post('/api/polling/start', (req, res) => { startPolling(); res.json({ success: true }); });
+app.post('/api/polling/stop', (req, res) => { if (pollInterval) { clearInterval(pollInterval); pollInterval = null; } res.json({ success: true }); });
+app.post('/api/polling/trigger', async (req, res) => { await fetchNewTransactions(); res.json({ success: true, transactions: txCache.data.length }); });
 app.post('/api/rebuild-cache', async (req, res) => {
   txCache.data = [];
   await saveJSON(FILES.progress, null);
