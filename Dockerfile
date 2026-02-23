@@ -4,5 +4,4 @@ COPY package*.json ./
 RUN npm install --production
 COPY . .
 EXPOSE 3005
-ENV PORT=3005
 CMD ["node", "server.js"]

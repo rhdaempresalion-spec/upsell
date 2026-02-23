@@ -1,724 +1,306 @@
-// ═══════════════════════════════════════════════════════════════
-//  DHR Lead Capture → CRM DataCrazy
-//  - Busca transações da Shield API (Basic Auth)
-//  - Extrai leads com nome + telefone
-//  - Valida números de telefone BR
-//  - NÃO envia ao CRM automaticamente (só manual)
-// ═══════════════════════════════════════════════════════════════
-
 import express from 'express';
 import fetch from 'node-fetch';
-import fs from 'fs/promises';
 import path from 'path';
-import http from 'http';
 import { fileURLToPath } from 'url';
-import { WebSocketServer } from 'ws';
-import { decodePIX } from './pix-decoder.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const CONFIG = {
-  PORT: process.env.PORT || 3005,
-  DHR_PUBLIC_KEY: process.env.DHR_PUBLIC_KEY || 'pk_WNNg2i_r8_iqeG3XrdJFI_q1I8ihd1yLoUa08Ip0LKaqxXxE',
-  DHR_SECRET_KEY: process.env.DHR_SECRET_KEY || 'sk_jz1yyIaa0Dw2OWhMH0r16gUgWZ7N2PCpb6aK1crKPIFq02aD',
-  DHR_API_URL: process.env.DHR_API_URL || 'https://api.shieldtecnologia.com/v1',
-  CRM_WEBHOOK_URL: process.env.CRM_WEBHOOK_URL || 'https://api.datacrazy.io/v1/crm/api/crm/flows/webhooks/a3161e6d-6f4d-4b16-a1b5-16bcb9641994/76e41ac2-564a-4ff6-9e28-ceee490c6544',
-  POLL_INTERVAL: 30000,
-  AUTO_SEND_CRM: false,
-  MAX_RETRIES: 5,
-  BATCH_SIZE: 3,
-  BATCH_DELAY: 1500,
-};
+const PK = 'pk_WNNg2i_r8_iqeG3XrdJFI_q1I8ihd1yLoUa08Ip0LKaqxXxE';
+const SK = 'sk_jz1yyIaa0Dw2OWhMH0r16gUgWZ7N2PCpb6aK1crKPIFq02aD';
+const API = 'https://api.shieldtecnologia.com/v1';
+const CRM = 'https://api.datacrazy.io/v1/crm/api/crm/flows/webhooks/a3161e6d-6f4d-4b16-a1b5-16bcb9641994/76e41ac2-564a-4ff6-9e28-ceee490c6544';
+const AUTH = 'Basic ' + Buffer.from(`${PK}:${SK}`).toString('base64');
+const PORT = process.env.PORT || 3005;
 
-const FILES = {
-  cache: path.join(__dirname, 'transactions_cache.json'),
-  leads: path.join(__dirname, 'leads_sent.json'),
-  progress: path.join(__dirname, 'fetch_progress.json'),
-};
+let transactions = [];
+let logs = [];
 
-let txCache = { data: [], lastUpdate: 0, isLoading: false };
-let leadsSent = {};
-let systemLogs = [];
-const wsClients = new Set();
-
-// ═══════════════════════════════════════
-//  UTILITÁRIOS
-// ═══════════════════════════════════════
-
-async function loadJSON(filepath, fallback) {
-  try { return JSON.parse(await fs.readFile(filepath, 'utf-8')); }
-  catch { return fallback; }
+function log(msg) {
+  const entry = { msg, time: new Date().toISOString() };
+  console.log(msg);
+  logs.unshift(entry);
+  if (logs.length > 200) logs.length = 200;
 }
 
-async function saveJSON(filepath, data) {
-  try { await fs.writeFile(filepath, JSON.stringify(data)); }
-  catch (e) { console.error(`Erro salvando ${filepath}:`, e.message); }
-}
-
-function broadcast(msg) {
-  const str = JSON.stringify(msg);
-  wsClients.forEach(ws => { if (ws.readyState === 1) ws.send(str); });
-}
-
-function addLog(type, message) {
-  const entry = { type, message, time: new Date().toISOString() };
-  const icon = type === 'success' ? '✅' : type === 'error' ? '❌' : 'ℹ️';
-  console.log(`${icon} ${message}`);
-  systemLogs.unshift(entry);
-  if (systemLogs.length > 500) systemLogs.length = 500;
-  broadcast({ type: 'log', payload: entry });
-}
-
-function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// ═══════════════════════════════════════
-//  VALIDAÇÃO DE TELEFONE BR
-// ═══════════════════════════════════════
-
-function validatePhoneBR(raw) {
-  if (!raw) return { valid: false, reason: 'vazio', formatted: '', digits: '', whatsapp: null };
-
-  let digits = String(raw).replace(/\D/g, '');
-  if (!digits) return { valid: false, reason: 'vazio', formatted: '', digits: '', whatsapp: null };
-
-  // Remover +55 se tiver
-  if (digits.startsWith('55') && digits.length >= 12) digits = digits.substring(2);
-
-  if (digits.length < 10 || digits.length > 11) {
-    return { valid: false, reason: `${digits.length} dígitos`, formatted: '', digits, whatsapp: null };
+// ══════ VALIDAR TELEFONE BR ══════
+function validarTelefone(raw) {
+  if (!raw) return { valido: false, motivo: 'vazio', formatado: '', whatsapp: '' };
+  let d = String(raw).replace(/\D/g, '');
+  if (d.startsWith('55') && d.length >= 12) d = d.substring(2);
+  if (d.length === 11 && d[2] === '9') {
+    const ddd = d.substring(0, 2);
+    const rest = d.substring(2);
+    if (/^(\d)\1+$/.test(rest)) return { valido: false, motivo: 'falso', formatado: '', whatsapp: '' };
+    return { valido: true, motivo: 'celular', formatado: `(${ddd}) ${rest[0]}${rest.substring(1,5)}-${rest.substring(5)}`, whatsapp: `55${d}` };
   }
-
-  const ddd = digits.substring(0, 2);
-  const dddNum = parseInt(ddd);
-  const dddsInvalidos = [0,1,2,3,4,5,6,7,8,9,10,20,23,25,26,29,30,36,39,40,50,52,56,57,58,59,60,70,72,76,78,80,90];
-  if (dddsInvalidos.includes(dddNum)) {
-    return { valid: false, reason: `DDD ${ddd} inválido`, formatted: '', digits, whatsapp: null };
+  if (d.length === 10) {
+    const ddd = d.substring(0, 2);
+    const rest = d.substring(2);
+    if (/^(\d)\1+$/.test(rest)) return { valido: false, motivo: 'falso', formatado: '', whatsapp: '' };
+    return { valido: true, motivo: 'fixo', formatado: `(${ddd}) ${rest.substring(0,4)}-${rest.substring(4)}`, whatsapp: '' };
   }
-
-  const rest = digits.substring(2);
-
-  // Número com dígitos todos iguais = falso
-  if (/^(\d)\1+$/.test(rest)) {
-    return { valid: false, reason: 'número falso', formatted: '', digits, whatsapp: null };
-  }
-
-  // Celular: 11 dígitos, começa com 9
-  if (digits.length === 11) {
-    if (rest[0] !== '9') {
-      return { valid: false, reason: 'celular deve começar com 9', formatted: '', digits, whatsapp: null };
-    }
-    const formatted = `(${ddd}) ${rest[0]}${rest.substring(1,5)}-${rest.substring(5)}`;
-    return { valid: true, reason: 'celular', formatted, digits, whatsapp: `55${digits}` };
-  }
-
-  // Fixo: 10 dígitos
-  if (digits.length === 10) {
-    const f = parseInt(rest[0]);
-    if (f < 2 || f > 5) {
-      return { valid: false, reason: 'fixo deve começar com 2-5', formatted: '', digits, whatsapp: null };
-    }
-    const formatted = `(${ddd}) ${rest.substring(0,4)}-${rest.substring(4)}`;
-    return { valid: true, reason: 'fixo', formatted, digits, whatsapp: null };
-  }
-
-  return { valid: false, reason: 'formato inválido', formatted: '', digits, whatsapp: null };
+  return { valido: false, motivo: `${d.length} digitos`, formatado: '', whatsapp: '' };
 }
 
-// ═══════════════════════════════════════
-//  SHIELD API — COM PROTEÇÃO RATE LIMIT
-// ═══════════════════════════════════════
-
-function getAuth() {
-  return 'Basic ' + Buffer.from(`${CONFIG.DHR_PUBLIC_KEY}:${CONFIG.DHR_SECRET_KEY}`).toString('base64');
+// ══════ BUSCAR TRANSAÇÕES (SÓ NOVAS) ══════
+async function fetchPage(page, size) {
+  const r = await fetch(`${API}/transactions?page=${page}&pageSize=${size}`, {
+    headers: { 'Authorization': AUTH, 'Connection': 'keep-alive' },
+    timeout: 30000,
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return await r.json();
 }
 
-async function fetchDHR(endpoint, retries = CONFIG.MAX_RETRIES) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const response = await fetch(`${CONFIG.DHR_API_URL}${endpoint}`, {
-        headers: { 'Authorization': getAuth(), 'Connection': 'keep-alive' },
-        timeout: 30000,
-      });
-
-      if (response.status === 429) {
-        const waitSec = Math.pow(2, attempt) * 5;
-        addLog('info', `⏳ Rate limit (429) — aguardando ${waitSec}s`);
-        await delay(waitSec * 1000);
-        continue;
-      }
-
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return await response.json();
-    } catch (error) {
-      if (attempt === retries) throw error;
-      await delay(Math.min(CONFIG.BATCH_DELAY * attempt, 10000));
-    }
-  }
-}
-
-// Buscar TODAS (com resume + rate limit)
-async function fetchAllTransactions() {
-  if (txCache.isLoading) { addLog('info', 'Busca em andamento...'); return txCache.data; }
-
-  txCache.isLoading = true;
-  addLog('info', 'Buscando TODAS as transações da API Shield...');
-  broadcast({ type: 'loading', payload: true });
-
-  const pageSize = 500;
-
+async function fetchLatest() {
   try {
-    const saved = await loadJSON(FILES.progress, null);
-    let all = [];
-    let startPage = 2;
-    let totalPages = 0;
-    let totalRecords = 0;
-
-    if (saved?.transactions?.length > 0 && saved?.nextPage > 2) {
-      all = saved.transactions;
-      startPage = saved.nextPage;
-      totalPages = saved.totalPages;
-      totalRecords = saved.totalRecords;
-      addLog('success', `♻️ Retomando: ${all.length} tx, página ${startPage}/${totalPages}`);
-    } else {
-      const first = await fetchDHR(`/transactions?page=1&pageSize=${pageSize}`);
-      all = first.data || [];
-      const pag = first.pagination || {};
-      totalPages = pag.totalPages || 1;
-      totalRecords = pag.totalRecords || 0;
-      addLog('info', `Total: ${totalRecords} transações em ${totalPages} páginas`);
-    }
-
-    if (totalPages > 1) {
-      const pages = [];
-      for (let p = startPage; p <= totalPages; p++) pages.push(p);
-
-      let errCount = 0;
-
-      for (let i = 0; i < pages.length; i += CONFIG.BATCH_SIZE) {
-        const batch = pages.slice(i, i + CONFIG.BATCH_SIZE);
-
-        try {
-          const results = await Promise.all(batch.map(p => fetchDHR(`/transactions?page=${p}&pageSize=${pageSize}`)));
-          results.forEach(d => { if (d?.data) all = all.concat(d.data); });
-          errCount = 0;
-        } catch (err) {
-          errCount++;
-          if (errCount >= 3) {
-            addLog('info', `💾 Salvando progresso: ${all.length} transações`);
-            await saveJSON(FILES.progress, { transactions: all, nextPage: batch[0], totalPages, totalRecords, savedAt: Date.now() });
-
-            if (all.length > 0) {
-              all.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-              txCache.data = all;
-              txCache.lastUpdate = Date.now();
-              await saveJSON(FILES.cache, { data: all, lastUpdate: txCache.lastUpdate });
-              broadcast({ type: 'new_transactions', payload: { count: all.length } });
-              addLog('success', `📦 Cache parcial: ${all.length} transações`);
-            }
-
-            addLog('info', '⏳ Aguardando 60s...');
-            await delay(60000);
-            errCount = 0;
-            i -= CONFIG.BATCH_SIZE;
-            continue;
-          }
-          addLog('error', `Erro lote: ${err.message}`);
-        }
-
-        const pct = Math.min(100, Math.round((i + CONFIG.BATCH_SIZE) / pages.length * 100));
-        addLog('info', `Progresso: ${pct}% (${all.length} transações)`);
-
-        if ((i + CONFIG.BATCH_SIZE) % 150 === 0) {
-          await saveJSON(FILES.progress, { transactions: all, nextPage: batch[batch.length-1]+1, totalPages, totalRecords, savedAt: Date.now() });
-          addLog('info', `💾 Checkpoint: ${all.length}`);
-        }
-
-        await delay(CONFIG.BATCH_DELAY);
-      }
-    }
-
-    all.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    txCache.data = all;
-    txCache.lastUpdate = Date.now();
-    txCache.isLoading = false;
-
-    await saveJSON(FILES.cache, { data: all, lastUpdate: txCache.lastUpdate });
-    await saveJSON(FILES.progress, null);
-
-    addLog('success', `✅ Cache COMPLETO: ${all.length} transações`);
-    broadcast({ type: 'loading', payload: false });
-    broadcast({ type: 'new_transactions', payload: { count: all.length } });
-    return all;
-
-  } catch (err) {
-    txCache.isLoading = false;
-    addLog('error', `Erro: ${err.message}`);
-    broadcast({ type: 'loading', payload: false });
-    return txCache.data;
-  }
-}
-
-async function fetchNewTransactions() {
-  if (txCache.isLoading) return;
-  if (txCache.data.length === 0) return await fetchAllTransactions();
-
-  txCache.isLoading = true;
-  try {
-    const data = await fetchDHR('/transactions?page=1&pageSize=100');
+    log('🔄 Buscando transações novas...');
+    const data = await fetchPage(1, 500);
     const newTxs = data.data || [];
-    if (!newTxs.length) { txCache.isLoading = false; return; }
-
-    const existingIds = new Set(txCache.data.map(t => t.id));
-    const brandNew = newTxs.filter(t => !existingIds.has(t.id));
-
-    if (brandNew.length > 0) {
-      addLog('success', `🆕 ${brandNew.length} novas transações!`);
-      txCache.data = [...brandNew, ...txCache.data];
-      txCache.lastUpdate = Date.now();
-      await saveJSON(FILES.cache, { data: txCache.data, lastUpdate: txCache.lastUpdate });
-      broadcast({ type: 'new_transactions', payload: { count: brandNew.length } });
-    }
-
-    let updated = 0;
-    for (const nt of newTxs) {
-      const ex = txCache.data.find(t => t.id === nt.id);
-      if (ex && ex.status !== nt.status) { Object.assign(ex, nt); updated++; }
-    }
-    if (updated > 0) {
-      addLog('info', `${updated} transações atualizadas`);
-      await saveJSON(FILES.cache, { data: txCache.data, lastUpdate: txCache.lastUpdate });
-    }
-  } catch (err) { addLog('error', `Erro incremental: ${err.message}`); }
-  txCache.isLoading = false;
-}
-
-// ═══════════════════════════════════════
-//  CRM (SÓ MANUAL)
-// ═══════════════════════════════════════
-
-function buildCRMPayload(tx) {
-  const cust = extractCustomer(tx);
-  const phone = validatePhoneBR(cust.phone);
-  return {
-    event: 'venda_paga', timestamp: new Date().toISOString(),
-    lead: {
-      nome: cust.name, email: cust.email,
-      telefone: phone.formatted || cust.phone,
-      telefone_valido: phone.valid, telefone_whatsapp: phone.whatsapp || '',
-      documento: cust.document,
-    },
-    transacao: {
-      id: tx.id, produto: tx.items?.[0]?.title || '',
-      valor: (tx.amount||0)/100, valor_liquido: (tx.fee?.netAmount||0)/100,
-      metodo_pagamento: tx.paymentMethod || '', parcelas: tx.installments || 1,
-      data_pagamento: tx.createdAt, status: tx.status,
-    },
-  };
-}
-
-async function sendLeadToCRM(tx) {
-  if (!CONFIG.CRM_WEBHOOK_URL) return false;
-  if (leadsSent[tx.id]) return true;
-  const cust = extractCustomer(tx);
-  const name = cust.name || 'Desconhecido';
-  const amount = ((tx.amount||0)/100).toFixed(2);
-  const payload = buildCRMPayload(tx);
-  
-  addLog('info', `CRM ← ${name} | Tel: ${cust.phone || 'sem'} | R$ ${amount}`);
-  
-  try {
-    const res = await fetch(CONFIG.CRM_WEBHOOK_URL, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload), timeout: 15000,
-    });
-    const text = await res.text().catch(() => '');
-    if (res.ok) {
-      leadsSent[tx.id] = { sentAt: new Date().toISOString(), ok: true };
-      await saveJSON(FILES.leads, leadsSent);
-      addLog('success', `CRM ✓ ${name} - R$ ${amount}`);
-      broadcast({ type: 'lead_sent', payload: { id: tx.id, name, amount } });
-      return true;
+    
+    if (transactions.length === 0) {
+      // Primeira vez — pegar as últimas 500
+      transactions = newTxs;
+      log(`✅ ${transactions.length} transações carregadas`);
     } else {
-      leadsSent[tx.id] = { sentAt: new Date().toISOString(), ok: false, error: `${res.status}` };
-      await saveJSON(FILES.leads, leadsSent);
-      addLog('error', `CRM erro ${res.status}: ${text.substring(0,200)}`);
-      return false;
+      // Só adicionar as novas
+      const ids = new Set(transactions.map(t => t.id));
+      const brand = newTxs.filter(t => !ids.has(t.id));
+      if (brand.length > 0) {
+        transactions = [...brand, ...transactions];
+        log(`🆕 ${brand.length} novas transações`);
+      }
+      // Atualizar status das existentes
+      for (const nt of newTxs) {
+        const ex = transactions.find(t => t.id === nt.id);
+        if (ex && ex.status !== nt.status) Object.assign(ex, nt);
+      }
     }
-  } catch (e) { addLog('error', `CRM falhou: ${e.message}`); return false; }
-}
-
-// ═══════════════════════════════════════
-//  LEADS — EXTRAÇÃO
-// ═══════════════════════════════════════
-
-function getLeads(txs, phoneFilter) {
-  const map = {};
-  txs.forEach(t => {
-    const cust = extractCustomer(t);
-    const key = cust.document || cust.email || cust.name;
-    if (!key) return;
-    if (!map[key]) {
-      const phone = validatePhoneBR(cust.phone);
-      map[key] = {
-        document: cust.document, name: cust.name,
-        email: cust.email, phoneRaw: cust.phone,
-        phoneFormatted: phone.formatted, phoneValid: phone.valid,
-        phoneType: phone.reason, whatsapp: phone.whatsapp || '',
-        firstPurchase: t.createdAt, lastPurchase: t.createdAt,
-        totalPurchases: 0, paidPurchases: 0, totalSpent: 0,
-        products: new Set(), crmStatus: 'pending',
-      };
-    }
-    const l = map[key];
-    l.totalPurchases++;
-    if (t.status === 'paid') {
-      l.paidPurchases++; l.totalSpent += (t.amount||0)/100;
-      if (leadsSent[t.id]) l.crmStatus = 'sent';
-    }
-    if (new Date(t.createdAt) < new Date(l.firstPurchase)) l.firstPurchase = t.createdAt;
-    if (new Date(t.createdAt) > new Date(l.lastPurchase)) l.lastPurchase = t.createdAt;
-    if (t.items?.[0]?.title) l.products.add(t.items[0].title.split(' - ')[0].trim());
-  });
-
-  let leads = Object.values(map).map(l => ({ ...l, products: Array.from(l.products).join(', ') }));
-  if (phoneFilter === 'valid') leads = leads.filter(l => l.phoneValid);
-  else if (phoneFilter === 'invalid') leads = leads.filter(l => !l.phoneValid && l.phoneRaw);
-  else if (phoneFilter === 'whatsapp') leads = leads.filter(l => l.whatsapp);
-  else if (phoneFilter === 'no_phone') leads = leads.filter(l => !l.phoneRaw);
-  return leads.sort((a, b) => new Date(b.lastPurchase) - new Date(a.lastPurchase));
-}
-
-function applyFilters(txs, filters) {
-  let r = [...txs];
-  if (filters.startDate) { const s = new Date(filters.startDate+'T00:00:00-03:00').getTime(); r = r.filter(t => new Date(t.createdAt).getTime() >= s); }
-  if (filters.endDate) { const e = new Date(filters.endDate+'T23:59:59-03:00').getTime(); r = r.filter(t => new Date(t.createdAt).getTime() <= e); }
-  if (filters.status === 'paid') r = r.filter(t => t.status === 'paid');
-  else if (filters.status === 'pending') r = r.filter(t => ['waiting_payment','pending'].includes(t.status));
-  if (filters.paymentMethod && filters.paymentMethod !== 'all') r = r.filter(t => t.paymentMethod === filters.paymentMethod);
-  if (filters.search) {
-    const q = filters.search.toLowerCase();
-    r = r.filter(t => {
-      const c = extractCustomer(t);
-      return c.name.toLowerCase().includes(q) || c.email.toLowerCase().includes(q) || c.document.includes(q) || c.phone.includes(q) || (t.id||'').toLowerCase().includes(q);
-    });
+  } catch (e) {
+    log(`❌ Erro: ${e.message}`);
   }
-  return r;
 }
 
-function getStats(txs) {
-  const paid = txs.filter(t => t.status === 'paid');
-  const pending = txs.filter(t => ['waiting_payment','pending'].includes(t.status));
-  const sentCount = paid.filter(t => leadsSent[t.id]).length;
-  const phoneStats = { valid: 0, invalid: 0, empty: 0, whatsapp: 0 };
-  const seen = new Set();
-  txs.forEach(t => {
-    const cust = extractCustomer(t);
-    const key = cust.document || cust.email;
-    if (!key || seen.has(key)) return; seen.add(key);
-    if (!cust.phone) { phoneStats.empty++; return; }
-    const v = validatePhoneBR(cust.phone);
-    if (v.valid) { phoneStats.valid++; if (v.whatsapp) phoneStats.whatsapp++; }
-    else phoneStats.invalid++;
-  });
-  return {
-    total: txs.length, paid: paid.length, pending: pending.length,
-    revenue: paid.reduce((s,t) => s+(t.amount||0),0)/100,
-    netRevenue: paid.reduce((s,t) => s+(t.fee?.netAmount||0),0)/100,
-    avgTicket: paid.length ? paid.reduce((s,t) => s+(t.amount||0),0)/paid.length/100 : 0,
-    conversion: txs.length ? (paid.length/txs.length*100).toFixed(1) : 0,
-    sentToCRM: sentCount, pendingCRM: paid.length - sentCount,
-    auto_send: CONFIG.AUTO_SEND_CRM, cacheAge: Date.now()-txCache.lastUpdate,
-    isLoading: txCache.isLoading, uniqueLeads: seen.size, phoneStats,
-  };
-}
-
-// ═══════════════════════════════════════
-//  EXPRESS
-// ═══════════════════════════════════════
-
+// ══════ EXPRESS ══════
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-app.get('/api/stats', (req, res) => res.json(getStats(applyFilters(txCache.data, req.query))));
-
-app.get('/api/transactions', (req, res) => {
-  const txs = applyFilters(txCache.data, req.query);
-  const page = parseInt(req.query.page)||1;
-  const pageSize = parseInt(req.query.pageSize)||50;
-  const start = (page-1)*pageSize;
+// DEBUG — ver estrutura real dos dados
+app.get('/api/debug', (req, res) => {
+  const sample = transactions.find(t => t.status === 'paid') || transactions[0];
+  if (!sample) return res.json({ error: 'Sem dados ainda' });
   res.json({
-    data: txs.slice(start, start+pageSize).map(t => ({
-      ...t, crmStatus: leadsSent[t.id] ? 'sent' : (t.status==='paid'?'pending':'n/a'),
-      crmSentAt: leadsSent[t.id]?.sentAt || null,
-    })),
-    pagination: { page, pageSize, totalRecords: txs.length, totalPages: Math.ceil(txs.length/pageSize) },
-  });
-});
-
-app.get('/api/leads', (req, res) => {
-  const txs = applyFilters(txCache.data, req.query);
-  res.json(getLeads(txs, req.query.phoneFilter || ''));
-});
-
-app.get('/api/sales', (req, res) => {
-  const txs = applyFilters(txCache.data, req.query);
-  res.json(txs.filter(t => t.status === 'paid').map(t => {
-    const cust = extractCustomer(t);
-    const ph = validatePhoneBR(cust.phone);
-    return {
-      id: t.id, date: t.createdAt, customer: cust.name || 'N/A',
-      email: cust.email || 'N/A', phone: ph.formatted || cust.phone || 'N/A',
-      phoneValid: ph.valid, whatsapp: ph.whatsapp || '',
-      document: cust.document || 'N/A', product: t.items?.[0]?.title || 'N/A',
-      amount: (t.amount||0)/100, netAmount: (t.fee?.netAmount||0)/100,
-      method: t.paymentMethod || 'N/A', installments: t.installments || 1,
-      crmStatus: leadsSent[t.id] ? 'sent' : 'pending', crmSentAt: leadsSent[t.id]?.sentAt || null,
-    };
-  }));
-});
-
-app.get('/api/products', (req, res) => {
-  const p = new Set();
-  txCache.data.forEach(t => { if (t.items?.[0]?.title) p.add(t.items[0].title.split(' - ')[0].trim()); });
-  res.json(Array.from(p).sort());
-});
-
-// ═══════════════════════════════════════
-//  EXTRAÇÃO INTELIGENTE DE DADOS DO CLIENTE
-//  A API pode ter campos com nomes diferentes
-// ═══════════════════════════════════════
-
-function extractCustomer(tx) {
-  const c = tx.customer || tx.buyer || tx.payer || tx.client || {};
-  
-  // Nome - tentar vários campos
-  const name = c.name || c.nome || c.fullName || c.full_name
-    || c.firstName && c.lastName ? `${c.firstName} ${c.lastName}` : ''
-    || c.first_name && c.last_name ? `${c.first_name} ${c.last_name}` : ''
-    || tx.customerName || tx.customer_name || tx.buyerName || '';
-
-  // Email
-  const email = c.email || c.emailAddress || c.email_address
-    || tx.customerEmail || tx.customer_email || '';
-
-  // Telefone - tentar MUITOS campos possíveis
-  const phone = c.phone || c.phoneNumber || c.phone_number
-    || c.cellphone || c.cellPhone || c.cell_phone
-    || c.mobile || c.mobilePhone || c.mobile_phone
-    || c.telefone || c.celular || c.fone
-    || c.phones?.[0]?.number || c.phones?.[0]
-    || c.phoneNumbers?.[0]?.number || c.phoneNumbers?.[0]
-    || tx.customerPhone || tx.customer_phone || '';
-
-  // Documento
-  const document = c.document?.number || c.document?.value || c.document
-    || c.cpf || c.cnpj || c.documentNumber || c.document_number
-    || c.taxId || c.tax_id || c.registro
-    || tx.customerDocument || '';
-
-  // Garantir que document é string
-  const docStr = typeof document === 'object' ? (document?.number || document?.value || JSON.stringify(document)) : String(document || '');
-
-  return { name: String(name || ''), email: String(email || ''), phone: String(phone || ''), document: docStr };
-}
-
-// Debug endpoint — mostra estrutura RAW de uma transação
-app.get('/api/debug-tx', (req, res) => {
-  if (txCache.data.length === 0) return res.json({ error: 'Sem dados no cache' });
-  // Pegar uma transação paga com customer
-  const sample = txCache.data.find(t => t.status === 'paid' && t.customer) || txCache.data[0];
-  const extracted = extractCustomer(sample);
-  res.json({
-    _info: 'Dados RAW da transação pra debug',
-    transactionKeys: Object.keys(sample),
-    customerRaw: sample.customer || sample.buyer || sample.payer || 'NENHUM CAMPO CUSTOMER',
+    _msg: 'ESTRUTURA REAL DA TRANSAÇÃO',
+    keys: Object.keys(sample),
+    customer: sample.customer,
     customerKeys: sample.customer ? Object.keys(sample.customer) : 'N/A',
-    extracted,
-    phoneValidation: validatePhoneBR(extracted.phone),
-    sampleId: sample.id,
-    sampleStatus: sample.status,
+    id: sample.id,
+    status: sample.status,
+    amount: sample.amount,
+    paymentMethod: sample.paymentMethod,
+    items: sample.items,
+    full: sample,
   });
 });
 
-// Listar os campos de TODAS as transações pra encontrar onde está o telefone
-app.get('/api/debug-fields', (req, res) => {
-  const fieldCount = {};
-  const customerFieldCount = {};
-  const phoneSamples = [];
-
-  txCache.data.slice(0, 200).forEach(tx => {
-    Object.keys(tx).forEach(k => { fieldCount[k] = (fieldCount[k] || 0) + 1; });
-    const c = tx.customer || tx.buyer || tx.payer || {};
-    if (typeof c === 'object' && c !== null) {
-      Object.keys(c).forEach(k => { customerFieldCount[k] = (customerFieldCount[k] || 0) + 1; });
-    }
-    // Procurar qualquer campo que pareça telefone
-    const extracted = extractCustomer(tx);
-    if (extracted.phone && phoneSamples.length < 5) {
-      phoneSamples.push({ id: tx.id, phone: extracted.phone, name: extracted.name });
-    }
+// Stats
+app.get('/api/stats', (req, res) => {
+  const paid = transactions.filter(t => t.status === 'paid');
+  const leads = new Map();
+  transactions.forEach(t => {
+    const key = t.customer?.document?.number || t.customer?.email;
+    if (key && !leads.has(key)) leads.set(key, t.customer);
   });
-
+  let telValid = 0, telInvalid = 0, telEmpty = 0, telWa = 0;
+  leads.forEach(c => {
+    const ph = c?.phone;
+    if (!ph) { telEmpty++; return; }
+    const v = validarTelefone(ph);
+    if (v.valido) { telValid++; if (v.whatsapp) telWa++; } else telInvalid++;
+  });
   res.json({
-    _info: 'Campos encontrados nas transações (200 primeiras)',
-    transactionFields: fieldCount,
-    customerFields: customerFieldCount,
-    phoneSamples,
-    totalTransactions: txCache.data.length,
+    total: transactions.length,
+    paid: paid.length,
+    revenue: paid.reduce((s, t) => s + (t.amount || 0), 0) / 100,
+    leads: leads.size,
+    telValid, telInvalid, telEmpty, telWa,
   });
 });
-app.get('/api/validate-phone/:phone', (req, res) => res.json(validatePhoneBR(req.params.phone)));
 
-// CRM — SÓ MANUAL (aceita rota nova E antiga)
-async function handleSend(req, res) {
-  const tx = txCache.data.find(t => t.id === req.params.id);
-  if (!tx) return res.status(404).json({ error: 'Não encontrada' });
-  res.json({ success: await sendLeadToCRM(tx) });
-}
-async function handleResend(req, res) {
-  const tx = txCache.data.find(t => t.id === req.params.id);
-  if (!tx) return res.status(404).json({ error: 'Não encontrada' });
-  delete leadsSent[tx.id];
-  res.json({ success: await sendLeadToCRM(tx) });
-}
-app.post('/api/crm/send/:id', handleSend);
-app.post('/api/crm/resend/:id', handleResend);
-// Aliases para compatibilidade com dashboard antigo
-app.post('/api/transactions/:id/send-crm', handleSend);
-app.post('/api/transactions/:id/resend-crm', handleResend);
-app.post('/api/crm/send-all', async (req, res) => {
-  const paid = txCache.data.filter(t => t.status === 'paid' && !leadsSent[t.id]);
-  if (!paid.length) return res.json({ success: true, sent: 0, total: 0 });
-  addLog('info', `Enviando ${paid.length} leads em lote...`);
-  let sent = 0;
-  for (const tx of paid) { if (await sendLeadToCRM(tx)) sent++; await delay(300); }
-  res.json({ success: true, sent, total: paid.length });
-});
-// Alias antigo
-app.post('/api/transactions/send-all', async (req, res) => {
-  const paid = txCache.data.filter(t => t.status === 'paid' && !leadsSent[t.id]);
-  if (!paid.length) return res.json({ success: true, sent: 0, total: 0 });
-  let sent = 0;
-  for (const tx of paid) { if (await sendLeadToCRM(tx)) sent++; await delay(300); }
-  res.json({ success: true, sent, total: paid.length });
-});
-app.post('/api/crm/send-valid', async (req, res) => {
-  const paid = txCache.data.filter(t => {
-    if (t.status !== 'paid' || leadsSent[t.id]) return false;
-    return validatePhoneBR(extractCustomer(t).phone).valid;
+// Leads
+app.get('/api/leads', (req, res) => {
+  const map = {};
+  const filter = req.query.phoneFilter || '';
+  const search = (req.query.search || '').toLowerCase();
+  
+  transactions.forEach(t => {
+    const c = t.customer;
+    if (!c) return;
+    const key = c.document?.number || c.email || c.name;
+    if (!key) return;
+    
+    if (!map[key]) {
+      const tel = validarTelefone(c.phone);
+      map[key] = {
+        nome: c.name || '',
+        email: c.email || '',
+        telefoneRaw: c.phone || '',
+        telefone: tel.formatado || c.phone || '',
+        telValido: tel.valido,
+        telMotivo: tel.motivo,
+        whatsapp: tel.whatsapp || '',
+        documento: c.document?.number || '',
+        compras: 0,
+        comprasPagas: 0,
+        totalGasto: 0,
+        ultimaCompra: t.createdAt,
+        produtos: new Set(),
+      };
+    }
+    const l = map[key];
+    l.compras++;
+    if (t.status === 'paid') {
+      l.comprasPagas++;
+      l.totalGasto += (t.amount || 0) / 100;
+    }
+    if (new Date(t.createdAt) > new Date(l.ultimaCompra)) l.ultimaCompra = t.createdAt;
+    if (t.items?.[0]?.title) l.produtos.add(t.items[0].title.split(' - ')[0].trim());
   });
-  if (!paid.length) return res.json({ success: true, sent: 0, total: 0 });
-  addLog('info', `Enviando ${paid.length} leads com telefone válido...`);
-  let sent = 0;
-  for (const tx of paid) { if (await sendLeadToCRM(tx)) sent++; await delay(300); }
-  res.json({ success: true, sent, total: paid.length });
+
+  let leads = Object.values(map).map(l => ({ ...l, produtos: Array.from(l.produtos).join(', ') }));
+
+  // Filtro telefone
+  if (filter === 'valid') leads = leads.filter(l => l.telValido);
+  else if (filter === 'whatsapp') leads = leads.filter(l => l.whatsapp);
+  else if (filter === 'invalid') leads = leads.filter(l => !l.telValido && l.telefoneRaw);
+  else if (filter === 'no_phone') leads = leads.filter(l => !l.telefoneRaw);
+
+  // Busca
+  if (search) {
+    leads = leads.filter(l =>
+      l.nome.toLowerCase().includes(search) ||
+      l.email.toLowerCase().includes(search) ||
+      l.documento.includes(search) ||
+      l.telefoneRaw.includes(search)
+    );
+  }
+
+  leads.sort((a, b) => new Date(b.ultimaCompra) - new Date(a.ultimaCompra));
+  res.json(leads);
 });
 
-app.get('/api/logs', (req, res) => res.json(systemLogs.slice(0, parseInt(req.query.limit)||100)));
-app.post('/api/crm/test', async (req, res) => {
+// Transações
+app.get('/api/transactions', (req, res) => {
+  let txs = [...transactions];
+  const search = (req.query.search || '').toLowerCase();
+  const status = req.query.status || '';
+  if (status === 'paid') txs = txs.filter(t => t.status === 'paid');
+  else if (status === 'pending') txs = txs.filter(t => ['waiting_payment', 'pending'].includes(t.status));
+  if (search) txs = txs.filter(t => (t.customer?.name || '').toLowerCase().includes(search) || (t.customer?.email || '').toLowerCase().includes(search) || (t.id || '').toString().includes(search));
+  
+  const page = parseInt(req.query.page) || 1;
+  const size = 50;
+  const start = (page - 1) * size;
+  res.json({
+    data: txs.slice(start, start + size),
+    pagination: { page, totalRecords: txs.length, totalPages: Math.ceil(txs.length / size) },
+  });
+});
+
+// CRM — enviar um lead
+app.post('/api/crm/send/:id', async (req, res) => {
+  const tx = transactions.find(t => String(t.id) === req.params.id);
+  if (!tx) return res.status(404).json({ error: 'Transação não encontrada' });
+  
+  const c = tx.customer || {};
+  const tel = validarTelefone(c.phone);
+  const payload = {
+    event: 'venda_paga',
+    lead: {
+      nome: c.name || '',
+      email: c.email || '',
+      telefone: tel.formatado || c.phone || '',
+      telefone_valido: tel.valido,
+      whatsapp: tel.whatsapp || '',
+      documento: c.document?.number || '',
+    },
+    transacao: {
+      id: tx.id,
+      valor: (tx.amount || 0) / 100,
+      produto: tx.items?.[0]?.title || '',
+      metodo: tx.paymentMethod || '',
+      status: tx.status,
+      data: tx.createdAt,
+    },
+  };
+
   try {
-    const r = await fetch(CONFIG.CRM_WEBHOOK_URL, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ event: 'test', lead: { nome: 'Teste' }, transacao: { id: 'test_'+Date.now(), valor: 0 } }),
+    log(`📤 CRM ← ${c.name || 'N/A'} | Tel: ${tel.formatado || c.phone || 'sem'} | R$ ${((tx.amount||0)/100).toFixed(2)}`);
+    const r = await fetch(CRM, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
     });
-    res.json({ success: r.ok, status: r.status });
-  } catch (e) { res.json({ success: false, error: e.message }); }
+    const text = await r.text().catch(() => '');
+    log(`CRM resposta: ${r.status} ${text.substring(0, 200)}`);
+    res.json({ success: r.ok, status: r.status, response: text.substring(0, 200) });
+  } catch (e) {
+    log(`❌ CRM erro: ${e.message}`);
+    res.json({ success: false, error: e.message });
+  }
 });
-// Alias antigo
+
+// Alias rota antiga
+app.post('/api/transactions/:id/send-crm', async (req, res) => {
+  // Redirecionar pra rota nova
+  req.params.id = req.params.id;
+  const tx = transactions.find(t => String(t.id) === req.params.id);
+  if (!tx) return res.status(404).json({ error: 'Não encontrada' });
+  
+  const c = tx.customer || {};
+  const tel = validarTelefone(c.phone);
+  try {
+    const r = await fetch(CRM, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'venda_paga',
+        lead: { nome: c.name||'', email: c.email||'', telefone: tel.formatado||c.phone||'', documento: c.document?.number||'' },
+        transacao: { id: tx.id, valor: (tx.amount||0)/100, produto: tx.items?.[0]?.title||'', status: tx.status },
+      }),
+    });
+    const text = await r.text().catch(() => '');
+    log(`CRM: ${r.status} — ${c.name} R$ ${((tx.amount||0)/100).toFixed(2)}`);
+    res.json({ success: r.ok, status: r.status });
+  } catch (e) {
+    log(`❌ CRM: ${e.message}`);
+    res.json({ success: false, error: e.message });
+  }
+});
+
 app.post('/api/test-crm', async (req, res) => {
   try {
-    const r = await fetch(CONFIG.CRM_WEBHOOK_URL, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ event: 'test', lead: { nome: 'Teste' }, transacao: { id: 'test_'+Date.now(), valor: 0 } }),
-    });
+    const r = await fetch(CRM, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ event: 'test', lead: { nome: 'Teste' } }) });
     res.json({ success: r.ok, status: r.status });
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
-app.post('/api/settings/auto-send', (req, res) => {
-  CONFIG.AUTO_SEND_CRM = req.body.enabled === true;
-  addLog('info', `Auto-send CRM: ${CONFIG.AUTO_SEND_CRM ? 'LIGADO' : 'DESLIGADO'}`);
-  res.json({ success: true, auto_send: CONFIG.AUTO_SEND_CRM });
-});
-app.post('/api/refresh', async (req, res) => {
-  await fetchNewTransactions();
-  res.json({ success: true, transactions: txCache.data.length });
-});
-// Aliases para compatibilidade com dashboard antigo
-app.post('/api/polling/start', (req, res) => { startPolling(); res.json({ success: true }); });
-app.post('/api/polling/stop', (req, res) => { if (pollInterval) { clearInterval(pollInterval); pollInterval = null; } res.json({ success: true }); });
-app.post('/api/polling/trigger', async (req, res) => { await fetchNewTransactions(); res.json({ success: true, transactions: txCache.data.length }); });
-app.post('/api/rebuild-cache', async (req, res) => {
-  txCache.data = [];
-  await saveJSON(FILES.progress, null);
-  await fetchAllTransactions();
-  res.json({ success: true, transactions: txCache.data.length });
-});
-app.post('/webhook/dhr', async (req, res) => {
-  addLog('info', 'Webhook recebido');
-  const raw = req.body?.data || req.body;
-  if (raw?.id) {
-    const ids = new Set(txCache.data.map(t => t.id));
-    if (!ids.has(raw.id)) {
-      txCache.data.unshift(raw); txCache.lastUpdate = Date.now();
-      broadcast({ type: 'new_transactions', payload: { count: 1 } });
-    }
-  }
-  res.json({ received: true });
-});
-app.get('/health', (req, res) => res.json({ status: 'ok', transactions: txCache.data.length, leadsSent: Object.keys(leadsSent).length }));
+
+app.post('/api/refresh', async (req, res) => { await fetchLatest(); res.json({ ok: true, total: transactions.length }); });
+app.get('/api/logs', (req, res) => res.json(logs));
+app.get('/health', (req, res) => res.json({ ok: true, transactions: transactions.length }));
+
 app.get('*', (req, res) => {
-  if (req.path.startsWith('/api/') || req.path.startsWith('/webhook/')) return res.status(404).json({ error: 'Not found' });
+  if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'Not found' });
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// ═══════════════════════════════════════
-//  SERVER + WEBSOCKET
-// ═══════════════════════════════════════
-
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
-wss.on('connection', ws => {
-  wsClients.add(ws);
-  ws.send(JSON.stringify({ type: 'init', payload: getStats(txCache.data) }));
-  ws.on('close', () => wsClients.delete(ws));
+// ══════ START ══════
+app.listen(PORT, () => {
+  console.log(`⚡ DHR Leads → http://localhost:${PORT}`);
+  console.log(`📍 Debug: http://localhost:${PORT}/api/debug`);
 });
 
-let pollInterval = null;
-function startPolling() {
-  if (pollInterval) return;
-  addLog('info', `🟢 Polling iniciado (${CONFIG.POLL_INTERVAL/1000}s)`);
-  pollInterval = setInterval(fetchNewTransactions, CONFIG.POLL_INTERVAL);
-}
-
-async function init() {
-  const cached = await loadJSON(FILES.cache, null);
-  if (cached?.data?.length) {
-    txCache.data = cached.data;
-    txCache.lastUpdate = cached.lastUpdate || Date.now();
-    addLog('info', `Cache carregado: ${txCache.data.length} transações`);
-  }
-  const saved = await loadJSON(FILES.leads, {});
-  leadsSent = saved || {};
-  addLog('info', `Leads enviados: ${Object.keys(leadsSent).length}`);
-
-  server.listen(CONFIG.PORT, () => {
-    console.log(`\n⚡ DHR Lead Capture → CRM DataCrazy`);
-    console.log(`📍 http://localhost:${CONFIG.PORT}`);
-    console.log(`📤 CRM auto-send: DESLIGADO (só manual)`);
-    console.log(`📦 Cache: ${txCache.data.length} transações\n`);
-  });
-
-  if (txCache.data.length === 0) {
-    addLog('info', 'Sem cache, buscando tudo da API...');
-    fetchAllTransactions().then(() => startPolling()).catch(() => startPolling());
-  } else {
-    setTimeout(() => fetchNewTransactions().catch(() => {}), 2000);
-    startPolling();
-  }
-}
-
-init();
-process.on('SIGINT', () => { clearInterval(pollInterval); process.exit(0); });
-process.on('SIGTERM', () => { clearInterval(pollInterval); process.exit(0); });
+// Buscar imediatamente + poll a cada 30s
+fetchLatest();
+setInterval(fetchLatest, 30000);

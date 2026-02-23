@@ -1,178 +1,215 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Lead Capture · DHR → CRM</title>
-  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <style>
-    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-    :root{--bg-0:#050609;--bg-1:#0a0c12;--bg-2:#0f1118;--bg-3:#14161f;--bg-4:#1a1d28;--bg-5:#21242f;--border:rgba(255,255,255,0.05);--bh:rgba(255,255,255,0.1);--t0:#f4f4f8;--t1:#bfc2d0;--t2:#7c7f92;--t3:#484b5e;--em:#10b981;--emd:#059669;--emb:rgba(16,185,129,0.07);--embb:rgba(16,185,129,0.12);--red:#ef4444;--redb:rgba(239,68,68,0.07);--blue:#3b82f6;--blueb:rgba(59,130,246,0.07);--amb:#f59e0b;--ambb:rgba(245,158,11,0.07);--vio:#8b5cf6;--viob:rgba(139,92,246,0.07);--cyan:#06b6d4;--pink:#ec4899;--mono:'IBM Plex Mono',monospace}
-    body{font-family:'Manrope',system-ui,sans-serif;background:var(--bg-0);color:var(--t1);min-height:100vh;-webkit-font-smoothing:antialiased}
-    ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-thumb{background:var(--bg-5);border-radius:10px}
-    body::after{content:'';position:fixed;inset:0;z-index:9999;pointer-events:none;opacity:.015;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
-    .glow{position:fixed;top:-200px;left:50%;transform:translateX(-50%);width:800px;height:500px;border-radius:50%;background:radial-gradient(ellipse,rgba(16,185,129,.04) 0%,transparent 70%);pointer-events:none;z-index:0}
-    .hdr{position:sticky;top:0;z-index:100;padding:0 28px;height:56px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:rgba(5,6,9,.85);backdrop-filter:blur(24px)}
-    .hdr-l{display:flex;align-items:center;gap:12px}
-    .logo{width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,var(--em),#0d9488);display:grid;place-items:center;box-shadow:0 0 20px rgba(16,185,129,.2)}
-    .logo svg{width:16px;height:16px;fill:none;stroke:#fff;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}
-    .lt{font-size:14px;font-weight:700;color:var(--t0);letter-spacing:-.4px}.ls{font-size:10px;color:var(--t3);letter-spacing:.5px;text-transform:uppercase;font-weight:600}
-    .hdr-r{display:flex;align-items:center;gap:8px}
-    .pill{display:inline-flex;align-items:center;gap:5px;padding:4px 12px;border-radius:100px;font-size:10px;font-weight:700;letter-spacing:.3px;text-transform:uppercase}
-    .pill-on{background:var(--emb);color:var(--em);border:1px solid var(--embb)}.pill-off{background:var(--bg-3);color:var(--t3);border:1px solid var(--border)}
-    .pdot{width:6px;height:6px;border-radius:50%;background:currentColor}
-    .pill-on .pdot{animation:bl 1.8s ease-in-out infinite;box-shadow:0 0 6px currentColor}
-    @keyframes bl{0%,100%{opacity:1}50%{opacity:.2}}
-    .pw{padding:4px 10px;border-radius:100px;font-family:var(--mono);font-size:9px;background:var(--bg-3);color:var(--t3);border:1px solid var(--border)}
-    .pw.ok{background:rgba(6,182,212,.08);color:var(--cyan);border-color:rgba(6,182,212,.12)}
-    .ib{width:32px;height:32px;border-radius:8px;background:transparent;border:1px solid var(--border);color:var(--t3);display:grid;place-items:center;cursor:pointer;transition:all .15s}.ib:hover{background:var(--bg-3);color:var(--t1)}
-    .main{position:relative;z-index:1;padding:24px 28px 40px;max-width:1480px;margin:0 auto}
-    .ban{background:var(--bg-1);border:1px solid var(--embb);border-radius:12px;padding:14px 20px;margin-bottom:20px;display:flex;align-items:center;gap:14px;font-size:13px}
-    .ban .dot{width:10px;height:10px;border-radius:50%;background:var(--em);box-shadow:0 0 8px var(--em);animation:bl 2s ease-in-out infinite;flex-shrink:0}
-    .ban strong{color:var(--t0)}.ban code{background:var(--bg-3);padding:2px 8px;border-radius:5px;font-family:var(--mono);font-size:11px;color:var(--cyan);cursor:pointer}
-    .sr{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:28px}
-    .st{background:var(--bg-1);border:1px solid var(--border);border-radius:14px;padding:18px 20px;position:relative;overflow:hidden;transition:border-color .2s}.st:hover{border-color:var(--bh)}
-    .stg{position:absolute;top:-20px;right:-20px;width:70px;height:70px;border-radius:50%;filter:blur(25px);opacity:.08}
-    .sti{font-size:11px;margin-bottom:8px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:.6px}
-    .stv{font-size:28px;font-weight:800;color:var(--t0);letter-spacing:-1.5px;line-height:1}
-    .stf{font-size:10px;font-weight:600;margin-top:6px}
-    .tb{display:flex;align-items:center;gap:8px;margin-bottom:20px;flex-wrap:wrap}
-    .btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:9px;font-family:inherit;font-size:12px;font-weight:700;cursor:pointer;border:none;transition:all .15s;white-space:nowrap}.btn:active{transform:scale(.97)}
-    .bg{background:var(--em);color:#fff;box-shadow:0 2px 12px rgba(16,185,129,.25)}.bg:hover{background:#0fa876}
-    .bf{background:var(--bg-3);color:var(--t2);border:1px solid var(--border)}.bf:hover{color:var(--t0);background:var(--bg-4)}
-    .bv{background:linear-gradient(135deg,var(--vio),#7c3aed);color:#fff}.bb{background:var(--blue);color:#fff}.bb:hover{background:#2563eb}
-    .tbr{margin-left:auto;display:flex;align-items:center;gap:8px}
-    .ck{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;color:var(--t2);cursor:pointer;padding:6px 14px;border-radius:9px;background:var(--bg-2);border:1px solid var(--border)}
-    .ck input{accent-color:var(--em);width:13px;height:13px}
-    .tabs{display:flex;gap:1px;margin-bottom:18px;background:var(--bg-2);border-radius:10px;padding:3px;width:fit-content}
-    .ta{padding:7px 18px;border-radius:8px;font-family:inherit;font-size:12px;font-weight:600;cursor:pointer;border:none;background:transparent;color:var(--t3);transition:all .15s}.ta:hover{color:var(--t2)}.ta.on{background:var(--bg-4);color:var(--t0);box-shadow:0 1px 4px rgba(0,0,0,.3)}
-    .nb{display:inline-block;min-width:16px;text-align:center;padding:0 5px;border-radius:8px;font-size:9px;font-weight:800;background:var(--bg-5);margin-left:5px}.ta.on .nb{background:rgba(16,185,129,.15);color:var(--em)}
-    .fls{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
-    .fb{padding:5px 13px;border-radius:7px;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:var(--bg-2);color:var(--t3)}.fb:hover{color:var(--t2)}.fb.on{background:var(--bg-4);color:var(--t0);border-color:var(--bh)}
-    .sb{margin-left:auto;padding:5px 12px;border-radius:7px;border:1px solid var(--border);background:var(--bg-2);color:var(--t1);font-family:inherit;font-size:12px;outline:none;width:220px}.sb:focus{border-color:rgba(16,185,129,.3)}.sb::placeholder{color:var(--t3)}
-    .tw{background:var(--bg-1);border:1px solid var(--border);border-radius:14px;overflow:hidden}table{width:100%;border-collapse:collapse}thead{background:var(--bg-2)}
-    th{padding:10px 16px;text-align:left;font-size:9px;font-weight:800;color:var(--t3);text-transform:uppercase;letter-spacing:1.2px;border-bottom:1px solid var(--border);white-space:nowrap}
-    td{padding:14px 16px;vertical-align:middle;border-bottom:1px solid rgba(255,255,255,.02);white-space:nowrap;font-size:13px}tbody tr{transition:background .1s;cursor:pointer}tbody tr:hover{background:rgba(255,255,255,.015)}
-    .cn{font-weight:700;color:var(--t0)}.ce{font-size:11px;color:var(--t3);margin-top:2px;font-family:var(--mono)}
-    .cp{color:var(--vio);font-size:12px;font-weight:600;font-family:var(--mono)}.ca{color:var(--em);font-weight:800;font-size:14px;font-family:var(--mono)}.cd{font-size:11px;color:var(--t3);font-family:var(--mono)}
-    .cpd{color:var(--t1);font-size:12px;max-width:180px;overflow:hidden;text-overflow:ellipsis}
-    .mt{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.5px}.mt.pix{color:var(--cyan)}.mt.card{color:var(--vio)}.mt.boleto{color:var(--amb)}.mt.oth{color:var(--t3)}
-    .bd{display:inline-flex;align-items:center;padding:3px 9px;border-radius:6px;font-size:9px;font-weight:800;letter-spacing:.5px;text-transform:uppercase}
-    .b-paid{background:var(--emb);color:var(--em)}.b-refunded{background:rgba(236,72,153,.07);color:var(--pink)}.b-pending{background:var(--ambb);color:var(--amb)}.b-failed{background:var(--redb);color:var(--red)}.b-cancelled,.b-unknown{background:var(--bg-3);color:var(--t3)}
-    .by{background:var(--blueb);color:var(--blue)}.bn{background:var(--bg-3);color:var(--t3)}
-    .ab{padding:4px 12px;border-radius:6px;font-family:inherit;font-size:10px;font-weight:800;cursor:pointer;border:none;transition:all .15s}.ab:active{transform:scale(.95)}
-    .abs{background:var(--em);color:#fff}.abs:hover{background:var(--emd)}.abs:disabled{opacity:.35}.abr{background:var(--bg-4);color:var(--blue);border:1px solid rgba(59,130,246,.12)}.abr:hover{background:var(--blueb)}
-    .empty{padding:60px 20px;text-align:center;color:var(--t3);font-size:13px}.emI{font-size:36px;margin-bottom:12px;opacity:.3}
-    .drb{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);opacity:0;pointer-events:none;transition:opacity .25s}.drb.show{opacity:1;pointer-events:all}
-    .dr{position:fixed;top:0;right:-480px;bottom:0;z-index:501;width:460px;max-width:100vw;background:var(--bg-1);border-left:1px solid var(--border);overflow-y:auto;transition:right .3s cubic-bezier(.16,1,.3,1);box-shadow:-10px 0 40px rgba(0,0,0,.4)}.dr.show{right:0}
-    .drh{padding:20px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--bg-1);z-index:2}
-    .drt{font-size:15px;font-weight:800;color:var(--t0)}.drx{background:none;border:none;color:var(--t3);font-size:20px;cursor:pointer}.drx:hover{color:var(--t1)}
-    .drbd{padding:24px}.ds{margin-bottom:22px}.dst{font-size:10px;font-weight:800;color:var(--t3);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
-    .drow{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.025)}.dl{font-size:12px;color:var(--t3);font-weight:600}.dv{font-size:12px;color:var(--t0);font-weight:600;text-align:right;max-width:55%;word-break:break-all}
-    .dv.m{font-family:var(--mono);font-size:11px}.dv.g{color:var(--em)}.dv.ph{color:var(--vio);cursor:pointer}.dv.ph:hover{text-decoration:underline}
-    .da{display:flex;gap:8px;margin-top:20px}.da .btn{flex:1;justify-content:center}
-    .draw{margin-top:16px}.draw summary{font-size:11px;color:var(--t3);cursor:pointer;font-weight:600;padding:6px 0}
-    .draw pre{margin-top:8px;padding:14px;border-radius:10px;background:var(--bg-0);border:1px solid var(--border);font-family:var(--mono);font-size:10px;color:var(--cyan);overflow:auto;max-height:300px;white-space:pre-wrap}
-    .lbox{background:var(--bg-0);border:1px solid var(--border);border-radius:14px;padding:16px;max-height:500px;overflow-y:auto;font-family:var(--mono);font-size:11px}
-    .ll{padding:3px 0;display:flex;gap:10px;border-bottom:1px solid rgba(255,255,255,.015)}.llt{color:var(--t3);min-width:68px}.llm{word-break:break-all;line-height:1.5}.llm.success{color:var(--em)}.llm.error{color:var(--red)}.llm.info{color:var(--blue)}
-    .mbg{position:fixed;inset:0;z-index:600;background:rgba(0,0,0,.65);backdrop-filter:blur(6px);display:none;place-items:center;padding:20px}.mbg.open{display:grid}
-    .mbox{background:var(--bg-1);border:1px solid var(--border);border-radius:18px;padding:28px;width:100%;max-width:520px;box-shadow:0 20px 60px rgba(0,0,0,.5);animation:mI .25s ease-out}
-    @keyframes mI{from{transform:scale(.95) translateY(10px);opacity:0}to{transform:none;opacity:1}}
-    .mh{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}.mtt{font-size:16px;font-weight:800;color:var(--t0)}
-    .mx{background:none;border:none;color:var(--t3);font-size:20px;cursor:pointer}.mx:hover{color:var(--t1)}
-    .fd{margin-bottom:14px}.fd label{display:block;font-size:10px;font-weight:700;color:var(--t3);margin-bottom:5px;text-transform:uppercase;letter-spacing:.5px}
-    .fd input{width:100%;padding:10px 14px;border-radius:10px;border:1px solid var(--border);background:var(--bg-0);color:var(--t1);font-family:inherit;font-size:13px;outline:none}.fd input:focus{border-color:rgba(16,185,129,.3)}
-    .toasts{position:fixed;top:64px;right:16px;z-index:9000;display:flex;flex-direction:column;gap:6px}
-    .tst{padding:10px 16px;border-radius:10px;font-size:12px;font-weight:600;max-width:340px;box-shadow:0 4px 20px rgba(0,0,0,.4);animation:tI .3s ease-out}
-    @keyframes tI{from{transform:translateX(100%);opacity:0}to{transform:none;opacity:1}}
-    .tst.ok{background:#052e16;color:var(--em);border:1px solid var(--embb)}.tst.err{background:#200505;color:var(--red);border:1px solid rgba(239,68,68,.15)}.tst.inf{background:#051830;color:var(--blue);border:1px solid rgba(59,130,246,.15)}
-    @media(max-width:768px){.hdr{padding:0 14px}.main{padding:16px 14px}.sr{grid-template-columns:repeat(2,1fr);gap:8px}.st{padding:14px 16px}.stv{font-size:22px}.sb{width:100%;margin-left:0;margin-top:6px}.dr{width:100vw}}
-    .si{opacity:0;transform:translateY(12px);animation:sI .5s ease-out forwards}.si:nth-child(1){animation-delay:0s}.si:nth-child(2){animation-delay:.05s}.si:nth-child(3){animation-delay:.1s}.si:nth-child(4){animation-delay:.15s}
-    @keyframes sI{to{opacity:1;transform:none}}
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DHR Leads</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0e17;--card:#111827;--border:#1f2937;--text:#e5e7eb;--dim:#6b7280;--green:#10b981;--red:#ef4444;--blue:#3b82f6;--amber:#f59e0b}
+body{font-family:-apple-system,system-ui,sans-serif;background:var(--bg);color:var(--text);padding:20px}
+h1{font-size:22px;margin-bottom:20px;color:var(--green)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px}
+.stat-label{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
+.stat-val{font-size:24px;font-weight:700}
+.stat-val.g{color:var(--green)}.stat-val.b{color:var(--blue)}.stat-val.r{color:var(--red)}.stat-val.a{color:var(--amber)}
+.toolbar{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
+input[type=text],select{padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#1a1f2e;color:var(--text);font-size:13px}
+input:focus{outline:none;border-color:var(--green)}
+.chip{padding:5px 14px;border-radius:20px;font-size:12px;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--dim);transition:.2s}
+.chip:hover,.chip.on{border-color:var(--green);color:var(--green);background:rgba(16,185,129,.1)}
+.btn{padding:8px 16px;border-radius:8px;border:none;font-size:13px;font-weight:600;cursor:pointer}
+.btn-g{background:var(--green);color:#fff}.btn-g:hover{background:#059669}
+.btn-s{background:#1a1f2e;color:var(--dim);border:1px solid var(--border)}.btn-s:hover{color:var(--text)}
+table{width:100%;border-collapse:collapse;margin-top:8px}
+th{padding:10px 12px;text-align:left;font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;background:#0d1117;border-bottom:1px solid var(--border)}
+td{padding:10px 12px;font-size:13px;border-bottom:1px solid rgba(255,255,255,.04)}
+tr:hover td{background:rgba(255,255,255,.02)}
+.ok{color:var(--green)}.nok{color:var(--red)}.empty{color:var(--dim)}
+.wa{color:var(--green);text-decoration:none;font-size:12px}.wa:hover{text-decoration:underline}
+.tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600}
+.tag-g{background:rgba(16,185,129,.15);color:var(--green)}
+.tag-a{background:rgba(245,158,11,.15);color:var(--amber)}
+.tabs{display:flex;gap:4px;margin-bottom:20px}
+.tab{padding:8px 18px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:500;color:var(--dim);background:transparent;border:none}
+.tab:hover{color:var(--text)}.tab.on{color:var(--green);background:rgba(16,185,129,.1)}
+.panel{display:none}.panel.on{display:block}
+.log{background:var(--card);border:1px solid var(--border);border-radius:10px;max-height:400px;overflow-y:auto;padding:8px;font-family:monospace;font-size:11px}
+.log div{padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.03)}
+.log .t{color:var(--dim);margin-right:8px}
+.toast{position:fixed;bottom:20px;right:20px;padding:12px 24px;border-radius:10px;font-size:13px;font-weight:500;background:#065f46;color:#a7f3d0;z-index:99;animation:si .3s}
+@keyframes si{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+.count{font-size:13px;color:var(--dim);margin-bottom:12px}
+</style>
 </head>
 <body>
-<div class="glow"></div><div class="toasts" id="toasts"></div>
-<header class="hdr">
-  <div class="hdr-l"><div class="logo"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div><div><div class="lt">Lead Capture</div><div class="ls">DHR → CRM DataCrazy</div></div></div>
-  <div class="hdr-r"><span class="pw" id="wsTag">ws: off</span><span class="pill pill-off" id="mPill"><span class="pdot"></span> Webhook</span>
-    <button class="ib" onclick="tog('whM')" title="Webhook"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></button>
-  </div>
-</header>
-<div class="main">
-  <div class="ban si"><div class="dot"></div><div><strong>Webhook ativo</strong> — Aguardando eventos DHR/Shield. Configure no painel: <code id="whB" onclick="copy(this.textContent)">loading...</code></div></div>
-  <div class="sr">
-    <div class="st si"><div class="stg" style="background:var(--vio)"></div><div class="sti">📊 Transações</div><div class="stv" id="sT">0</div><div class="stf" style="color:var(--vio)" id="sP">0 pagas</div></div>
-    <div class="st si"><div class="stg" style="background:var(--em)"></div><div class="sti">💰 Receita</div><div class="stv" id="sR">R$ 0</div><div class="stf" style="color:var(--em)">aprovadas</div></div>
-    <div class="st si"><div class="stg" style="background:var(--blue)"></div><div class="sti">📤 Enviados</div><div class="stv" id="sS">0</div><div class="stf" style="color:var(--blue)" id="sSo">de 0</div></div>
-    <div class="st si"><div class="stg" style="background:var(--amb)"></div><div class="sti">⏳ Pendentes</div><div class="stv" id="sPn">0</div><div class="stf" style="color:var(--amb)">aguardando</div></div>
-  </div>
-  <div class="tb">
-    <button class="btn bg" onclick="testWH()">🧪 Simular Venda</button>
-    <button class="btn bb" onclick="tog('addM')">+ Adicionar Lead</button>
-    <button class="btn bv" id="bba" onclick="sendAll()" style="display:none">📤 Enviar Todos</button>
-    <div class="tbr"><label class="ck"><input type="checkbox" id="ckA" checked onchange="togAuto(this.checked)"> Auto-envio CRM</label><button class="btn bf" onclick="testCRM()">📡 Testar CRM</button></div>
-  </div>
-  <div class="tabs"><button class="ta on" onclick="swTab('leads',this)">Leads <span class="nb" id="nL">0</span></button><button class="ta" onclick="swTab('logs',this)">Logs</button></div>
-  <div id="pL">
-    <div class="fls"><button class="fb on" onclick="filt('all',this)">Todos</button><button class="fb" onclick="filt('paid',this)">Pagos</button><button class="fb" onclick="filt('sent',this)">Enviados</button><button class="fb" onclick="filt('pending',this)">Pendentes</button><input class="sb" placeholder="🔍  Buscar..." oninput="S.q=this.value;render()"></div>
-    <div class="tw"><div style="overflow-x:auto"><table><thead><tr><th>Lead</th><th>Telefone</th><th>Produto</th><th>Valor</th><th>Método</th><th>Status</th><th>CRM</th><th>Data</th><th style="text-align:center;width:90px">Ação</th></tr></thead><tbody id="tbody"><tr><td colspan="9" class="empty"><div class="emI">⚡</div>Aguardando leads via webhook...<br><small style="color:var(--t3)">ou clique "Simular Venda" para testar</small></td></tr></tbody></table></div></div>
-  </div>
-  <div id="pLg" style="display:none"><div class="lbox" id="logBox"><div style="color:var(--t3);text-align:center;padding:40px">Logs...</div></div></div>
+
+<h1>⚡ DHR Leads</h1>
+
+<div class="stats" id="stats"></div>
+
+<div class="tabs">
+  <button class="tab on" onclick="showTab('leads')">👥 Leads</button>
+  <button class="tab" onclick="showTab('txs')">💳 Transações</button>
+  <button class="tab" onclick="showTab('logs')">📋 Logs</button>
 </div>
-<div class="drb" id="drBg" onclick="closeDr()"></div>
-<div class="dr" id="drP"><div class="drh"><div class="drt" id="drT">Detalhes</div><button class="drx" onclick="closeDr()">✕</button></div><div class="drbd" id="drB"></div></div>
-<div class="mbg" id="addM" onclick="if(event.target===this)this.classList.remove('open')">
-  <div class="mbox"><div class="mh"><div class="mtt">+ Adicionar Lead</div><button class="mx" onclick="tog('addM')">✕</button></div>
-    <div class="fd"><label>Nome</label><input id="aN" placeholder="João Silva"></div>
-    <div class="fd"><label>Email</label><input id="aE" placeholder="joao@email.com"></div>
-    <div class="fd"><label>Telefone (WhatsApp)</label><input id="aP" placeholder="5511999887766"></div>
-    <div class="fd"><label>CPF</label><input id="aD" placeholder="12345678900"></div>
-    <div class="fd"><label>Produto</label><input id="aPr" placeholder="Curso Premium"></div>
-    <div class="fd"><label>Valor (R$)</label><input id="aV" type="number" step="0.01" placeholder="297.00"></div>
-    <button class="btn bg" style="width:100%;justify-content:center;margin-top:8px" onclick="addLead()">Salvar e Enviar ao CRM</button>
+
+<!-- LEADS -->
+<div class="panel on" id="p-leads">
+  <div class="toolbar">
+    <input type="text" id="leadQ" placeholder="Buscar nome, email, CPF, telefone..." style="width:280px" oninput="loadLeads()">
+    <span class="chip on" onclick="setFilter(this,'')">Todos</span>
+    <span class="chip" onclick="setFilter(this,'valid')">✓ Válidos</span>
+    <span class="chip" onclick="setFilter(this,'whatsapp')">💬 WhatsApp</span>
+    <span class="chip" onclick="setFilter(this,'invalid')">✗ Inválidos</span>
+    <span class="chip" onclick="setFilter(this,'no_phone')">Sem Tel.</span>
+    <button class="btn btn-s" onclick="refresh()">↻ Atualizar</button>
   </div>
+  <div class="count" id="leadCount"></div>
+  <table>
+    <thead><tr><th>Nome</th><th>Telefone</th><th>Status</th><th>WhatsApp</th><th>Email</th><th>Documento</th><th>Compras</th><th>Gasto</th><th>CRM</th></tr></thead>
+    <tbody id="leadTbl"></tbody>
+  </table>
 </div>
-<div class="mbg" id="whM" onclick="if(event.target===this)this.classList.remove('open')">
-  <div class="mbox" style="max-width:640px"><div class="mh"><div class="mtt">🔗 Webhook Setup</div><button class="mx" onclick="tog('whM')">✕</button></div>
-    <div style="font-size:12px;color:var(--t2);line-height:2">
-      <strong style="color:var(--em)">Configure no painel DHR/Shield:</strong><br>
-      <code id="whUrl" style="display:block;padding:10px 14px;border-radius:8px;background:var(--bg-0);cursor:pointer;font-size:13px;border:1px solid var(--border);margin:8px 0;font-family:var(--mono);color:var(--cyan)" onclick="copy(this.textContent)">loading...</code>
-      <strong style="color:var(--em)">Método:</strong> POST · <strong style="color:var(--em)">Content-Type:</strong> application/json<br><br>
-      <strong style="color:var(--em)">URLs alternativas:</strong><br>
-      <code>/webhook/dhr</code> · <code>/webhook/shield</code> · <code>/webhook</code> · <code>/postback</code> · <code>/callback</code><br><br>
-      <strong style="color:var(--em)">Aceita QUALQUER formato de payload.</strong>
-    </div>
+
+<!-- TXS -->
+<div class="panel" id="p-txs">
+  <div class="toolbar">
+    <input type="text" id="txQ" placeholder="Buscar..." style="width:240px" oninput="loadTxs()">
+    <select id="txSt" onchange="loadTxs()"><option value="">Todas</option><option value="paid">Pagas</option><option value="pending">Pendentes</option></select>
+    <button class="btn btn-s" onclick="refresh()">↻ Atualizar</button>
+  </div>
+  <table>
+    <thead><tr><th>Data</th><th>Nome</th><th>Telefone</th><th>Email</th><th>Produto</th><th>Valor</th><th>Status</th><th>CRM</th></tr></thead>
+    <tbody id="txTbl"></tbody>
+  </table>
+  <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+    <button class="btn btn-s" onclick="txPage=Math.max(1,txPage-1);loadTxs()">◂ Anterior</button>
+    <span id="txPag" style="font-size:12px;color:var(--dim)"></span>
+    <button class="btn btn-s" onclick="txPage++;loadTxs()">Próxima ▸</button>
   </div>
 </div>
+
+<!-- LOGS -->
+<div class="panel" id="p-logs">
+  <div class="log" id="logBox"></div>
+</div>
+
 <script>
-const S={leads:[],logs:[],f:'all',q:''};const $=id=>document.getElementById(id);const esc=s=>{const d=document.createElement('div');d.textContent=s;return d.innerHTML};const p=n=>String(n).padStart(2,'0');
-async function api(m,u,b){try{const o={method:m,headers:{'Content-Type':'application/json'}};if(b)o.body=JSON.stringify(b);return await(await fetch(u,o)).json()}catch(e){return{error:e.message}}}
-async function loadStats(){const s=await api('GET','/api/stats');if(s.error)return;$('sT').textContent=s.total;$('sP').textContent=s.paid+' pagas';$('sR').textContent='R$ '+(s.revenue||0).toLocaleString('pt-BR',{minimumFractionDigits:2});$('sS').textContent=s.sent;$('sSo').textContent='de '+s.paid;$('sPn').textContent=s.pending_send;$('nL').textContent=s.total;$('ckA').checked=s.auto_send;const b=$('bba');if(s.pending_send>0){b.style.display='';b.textContent='📤 Enviar Todos ('+s.pending_send+')'}else b.style.display='none';$('mPill').className=s.total>0?'pill pill-on':'pill pill-off'}
-async function loadLeads(){const d=await api('GET','/api/transactions?limit=500');if(d.data){S.leads=d.data;render()}}
-async function loadLogs(){const d=await api('GET','/api/logs?limit=150');if(d.data){S.logs=d.data.map(l=>({type:l.type,msg:l.message,t:fmtT(l.created_at)}));renderLogs()}}
-async function testWH(){toast('Simulando...','inf');const r=await api('POST','/api/test-webhook');if(r.success){toast('✓ Venda teste criada!','ok');await loadLeads();await loadStats()}else toast('Falha','err')}
-async function testCRM(){toast('Testando CRM...','inf');const r=await api('POST','/api/test-crm');toast(r.success?'CRM OK! ('+r.status+')':'CRM falhou','inf')}
-async function sendOne(id){const b=document.querySelector('[data-sid="'+id+'"]');if(b){b.disabled=true;b.textContent='...'}const r=await api('POST','/api/transactions/'+id+'/send-crm');toast(r.success?'Enviado!':'Falha',r.success?'ok':'err');await loadLeads();await loadStats()}
-async function resend(id){const r=await api('POST','/api/transactions/'+id+'/resend-crm');toast(r.success?'Reenviado!':'Falha',r.success?'ok':'err');await loadLeads();await loadStats()}
-async function sendAll(){toast('Enviando...','inf');const r=await api('POST','/api/transactions/send-all');toast((r.sent||0)+' de '+(r.total||0)+' enviados!',r.sent>0?'ok':'err');await loadLeads();await loadStats()}
-async function togAuto(v){await api('POST','/api/settings/auto-send',{enabled:v});toast('Auto-envio '+(v?'ON':'OFF'),'inf')}
-async function addLead(){const b={name:$('aN').value,email:$('aE').value,phone:$('aP').value,document:$('aD').value,product:$('aPr').value,amount:$('aV').value};if(!b.name&&!b.email&&!b.phone){toast('Preencha algo','err');return}const r=await api('POST','/api/transactions/add',b);if(r.success){toast('Lead adicionado!','ok');tog('addM');['aN','aE','aP','aD','aPr','aV'].forEach(id=>$(id).value='');await loadLeads();await loadStats()}else toast('Erro','err')}
-function render(){const tb=$('tbody');let L=S.leads;if(S.f==='paid')L=L.filter(l=>l.status==='paid');else if(S.f==='sent')L=L.filter(l=>l.sent_to_crm);else if(S.f==='pending')L=L.filter(l=>l.status==='paid'&&!l.sent_to_crm);if(S.q){const q=S.q.toLowerCase();L=L.filter(l=>(l.customer_name||'').toLowerCase().includes(q)||(l.customer_email||'').toLowerCase().includes(q)||(l.customer_phone||'').includes(q)||(l.product||'').toLowerCase().includes(q))}if(!L.length){tb.innerHTML='<tr><td colspan="9" class="empty"><div class="emI">'+(S.leads.length?'🔍':'⚡')+'</div>'+(S.leads.length?'Nenhum resultado':'Aguardando leads...')+'</td></tr>';return}
-tb.innerHTML=L.map(tx=>{const mt=(tx.payment_method||'').toLowerCase(),mc=mt.includes('pix')?'pix':mt.includes('boleto')?'boleto':(mt.includes('card')||mt.includes('credit')||mt.includes('cartao'))?'card':'oth';const ml=mc==='pix'?'◉ PIX':mc==='boleto'?'◎ BOLETO':mc==='card'?'◎ CARTÃO':(mt.toUpperCase()||'—');const sl={paid:'Pago',refunded:'Reembolso',pending:'Pendente',failed:'Falhou',cancelled:'Cancelado'}[tx.status]||tx.status||'—';const amt=typeof tx.amount==='number'?tx.amount.toLocaleString('pt-BR',{minimumFractionDigits:2}):tx.amount;let act;if(!tx.sent_to_crm&&tx.status==='paid')act='<button class="ab abs" data-sid="'+tx.id+'" onclick="event.stopPropagation();sendOne(\''+tx.id+'\')">Enviar</button>';else if(tx.sent_to_crm)act='<button class="ab abr" onclick="event.stopPropagation();resend(\''+tx.id+'\')">↻</button>';else act='<span style="color:var(--t3)">—</span>';return'<tr onclick="openDr(\''+tx.id+'\')"><td><div class="cn">'+esc(tx.customer_name||'—')+'</div><div class="ce">'+esc(tx.customer_email||'')+'</div></td><td><span class="cp">'+esc(tx.customer_phone||'—')+'</span></td><td><span class="cpd">'+esc(tx.product||'—')+'</span></td><td><span class="ca">R$ '+amt+'</span></td><td><span class="mt '+mc+'">'+ml+'</span></td><td><span class="bd b-'+(tx.status||'unknown')+'">'+sl+'</span></td><td><span class="bd '+(tx.sent_to_crm?'by':'bn')+'">'+(tx.sent_to_crm?'✓ Enviado':'Pendente')+'</span></td><td><span class="cd">'+fmtDT(tx.created_at)+'</span></td><td style="text-align:center">'+act+'</td></tr>'}).join('')}
-function renderLogs(){const b=$('logBox');if(!S.logs.length){b.innerHTML='<div style="color:var(--t3);text-align:center;padding:40px">Nenhum log...</div>';return}b.innerHTML=S.logs.map(l=>{const ic=l.type==='success'?'✓':l.type==='error'?'✗':'ℹ';return'<div class="ll"><span class="llt">'+l.t+'</span><span class="llm '+l.type+'">'+ic+' '+esc(l.msg)+'</span></div>'}).join('')}
-function openDr(id){const tx=S.leads.find(l=>l.id===id);if(!tx)return;$('drT').textContent=tx.customer_name||'Lead';const mt=(tx.payment_method||'').toLowerCase(),mc=mt.includes('pix')?'PIX':mt.includes('boleto')?'Boleto':(mt.includes('card')||mt.includes('credit'))?'Cartão':mt||'—';const sl={paid:'Pago',refunded:'Reembolso',pending:'Pendente',failed:'Falhou',cancelled:'Cancelado'}[tx.status]||tx.status;const amt=typeof tx.amount==='number'?'R$ '+tx.amount.toLocaleString('pt-BR',{minimumFractionDigits:2}):tx.amount;const wa=tx.customer_phone?'https://wa.me/'+tx.customer_phone.replace(/\D/g,''):'#';let acts='';if(!tx.sent_to_crm&&tx.status==='paid')acts='<button class="btn bg" style="flex:1;justify-content:center" onclick="sendOne(\''+tx.id+'\');closeDr()">📤 Enviar CRM</button>';else if(tx.sent_to_crm)acts='<button class="btn bf" style="flex:1;justify-content:center" onclick="resend(\''+tx.id+'\');closeDr()">↻ Reenviar</button>';$('drB').innerHTML='<div class="ds"><div class="dst">Lead</div><div class="drow"><span class="dl">Nome</span><span class="dv">'+esc(tx.customer_name||'—')+'</span></div><div class="drow"><span class="dl">Email</span><span class="dv m">'+esc(tx.customer_email||'—')+'</span></div><div class="drow"><span class="dl">Telefone</span><span class="dv ph m" onclick="window.open(\''+wa+'\',\'_blank\')">'+esc(tx.customer_phone||'—')+' ↗</span></div><div class="drow"><span class="dl">Documento</span><span class="dv m">'+esc(tx.customer_document||'—')+'</span></div></div><div class="ds"><div class="dst">Transação</div><div class="drow"><span class="dl">ID</span><span class="dv m" style="font-size:10px">'+esc(tx.id)+'</span></div><div class="drow"><span class="dl">Produto</span><span class="dv">'+esc(tx.product||'—')+'</span></div><div class="drow"><span class="dl">Valor</span><span class="dv g" style="font-size:16px;font-weight:800">'+amt+'</span></div><div class="drow"><span class="dl">Método</span><span class="dv">'+mc+'</span></div><div class="drow"><span class="dl">Status</span><span class="dv"><span class="bd b-'+tx.status+'">'+sl+'</span></span></div><div class="drow"><span class="dl">Data</span><span class="dv m">'+fmtDT(tx.created_at)+'</span></div></div><div class="ds"><div class="dst">CRM</div><div class="drow"><span class="dl">Enviado</span><span class="dv"><span class="bd '+(tx.sent_to_crm?'by':'bn')+'">'+(tx.sent_to_crm?'Sim':'Não')+'</span></span></div>'+(tx.sent_at?'<div class="drow"><span class="dl">Em</span><span class="dv m">'+fmtDT(tx.sent_at)+'</span></div>':'')+'</div><div class="da">'+acts+(tx.customer_phone?'<a href="'+wa+'" target="_blank" class="btn bf" style="flex:1;justify-content:center;text-decoration:none;color:var(--em)">💬 WhatsApp</a>':'')+'</div>'+(tx.raw_data?'<details class="draw"><summary>JSON bruto</summary><pre>'+esc(tryP(tx.raw_data))+'</pre></details>':'');$('drBg').classList.add('show');$('drP').classList.add('show')}
-function closeDr(){$('drBg').classList.remove('show');$('drP').classList.remove('show')}
-function wsConnect(){const ws=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/ws');ws.onopen=()=>{$('wsTag').textContent='ws: on';$('wsTag').className='pw ok'};ws.onclose=()=>{$('wsTag').textContent='ws: off';$('wsTag').className='pw';setTimeout(wsConnect,3000)};ws.onerror=()=>ws.close();ws.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type==='init')$('ckA').checked=m.payload.auto_send;if(m.type==='new_transaction'){toast('⚡ '+(m.payload.customer_name||'Nova venda')+' — R$ '+m.payload.amount,'ok');loadLeads();loadStats()}if(m.type==='lead_sent'){loadLeads();loadStats()}if(m.type==='log'){S.logs.unshift({type:m.payload.type,msg:m.payload.message,t:fmtT(m.payload.time)});if(S.logs.length>200)S.logs.length=200;renderLogs()}}catch(e){}}}
-function swTab(t,el){document.querySelectorAll('.ta').forEach(n=>n.classList.remove('on'));el.classList.add('on');$('pL').style.display=t==='leads'?'':'none';$('pLg').style.display=t==='logs'?'':'none';if(t==='logs')loadLogs()}
-function filt(f,el){S.f=f;document.querySelectorAll('.fb').forEach(b=>b.classList.remove('on'));el.classList.add('on');render()}
-function tog(id){$(id).classList.toggle('open')}
-function toast(msg,type){const c=$('toasts'),d=document.createElement('div');d.className='tst '+(type||'inf');d.textContent=msg;c.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transition='opacity .3s';setTimeout(()=>d.remove(),300)},4000)}
-function copy(t){navigator.clipboard?.writeText(t.trim());toast('Copiado!','ok')}
-function fmtDT(dt){if(!dt)return'—';try{const d=new Date(dt);if(isNaN(d))return dt;return p(d.getDate())+'/'+p(d.getMonth()+1)+' '+p(d.getHours())+':'+p(d.getMinutes())}catch(e){return dt}}
-function fmtT(dt){if(!dt)return'';try{const d=new Date(dt);if(isNaN(d))return dt;return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())}catch(e){return dt}}
-function tryP(s){try{return JSON.stringify(JSON.parse(s),null,2)}catch(e){return s}}
-(async()=>{const u=location.origin+'/webhook/dhr';$('whUrl').textContent=u;$('whB').textContent=u;await loadStats();await loadLeads();wsConnect();setInterval(loadStats,12000)})();
+const fmt = v => 'R$ ' + Number(v).toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+const esc = s => { if(!s) return ''; const d=document.createElement('div'); d.textContent=s; return d.innerHTML; };
+const $ = id => document.getElementById(id);
+
+let phoneFilter = '', txPage = 1;
+
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('on'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('on'));
+  event.target.classList.add('on');
+  $(`p-${name}`).classList.add('on');
+  if (name === 'leads') loadLeads();
+  if (name === 'txs') loadTxs();
+  if (name === 'logs') loadLogs();
+}
+
+function setFilter(el, f) {
+  document.querySelectorAll('.chip').forEach(c => c.classList.remove('on'));
+  el.classList.add('on');
+  phoneFilter = f;
+  loadLeads();
+}
+
+function toast(msg) {
+  const t = document.createElement('div'); t.className='toast'; t.textContent=msg;
+  document.body.appendChild(t); setTimeout(()=>t.remove(),3000);
+}
+
+async function loadStats() {
+  try {
+    const s = await (await fetch('/api/stats')).json();
+    $('stats').innerHTML = `
+      <div class="stat"><div class="stat-label">Transações</div><div class="stat-val b">${s.total}</div></div>
+      <div class="stat"><div class="stat-label">Receita</div><div class="stat-val g">${fmt(s.revenue)}</div></div>
+      <div class="stat"><div class="stat-label">Leads</div><div class="stat-val b">${s.leads}</div></div>
+      <div class="stat"><div class="stat-label">Tel. Válidos</div><div class="stat-val g">${s.telValid}</div></div>
+      <div class="stat"><div class="stat-label">WhatsApp</div><div class="stat-val g">${s.telWa}</div></div>
+      <div class="stat"><div class="stat-label">Tel. Inválidos</div><div class="stat-val r">${s.telInvalid}</div></div>
+      <div class="stat"><div class="stat-label">Sem Telefone</div><div class="stat-val a">${s.telEmpty}</div></div>
+    `;
+  } catch(e) {}
+}
+
+async function loadLeads() {
+  try {
+    const q = $('leadQ')?.value || '';
+    const leads = await (await fetch(`/api/leads?search=${encodeURIComponent(q)}&phoneFilter=${phoneFilter}`)).json();
+    $('leadCount').textContent = `${leads.length} leads`;
+    $('leadTbl').innerHTML = leads.map(l => `<tr>
+      <td><b>${esc(l.nome)}</b></td>
+      <td style="font-family:monospace;font-size:12px">${esc(l.telefone) || esc(l.telefoneRaw) || '<span class="empty">-</span>'}</td>
+      <td>${l.telValido ? '<span class="ok">✓ '+l.telMotivo+'</span>' : l.telefoneRaw ? '<span class="nok">✗ '+l.telMotivo+'</span>' : '<span class="empty">sem tel.</span>'}</td>
+      <td>${l.whatsapp ? `<a class="wa" href="https://wa.me/${l.whatsapp}" target="_blank">💬 ${l.whatsapp}</a>` : '-'}</td>
+      <td style="font-size:12px;color:var(--dim)">${esc(l.email)}</td>
+      <td style="font-family:monospace;font-size:11px">${esc(l.documento)}</td>
+      <td>${l.comprasPagas}/${l.compras}</td>
+      <td style="color:var(--green);font-weight:600">${fmt(l.totalGasto)}</td>
+      <td>-</td>
+    </tr>`).join('') || '<tr><td colspan="9" style="text-align:center;color:var(--dim);padding:40px">Nenhum lead encontrado</td></tr>';
+  } catch(e) { console.error(e); }
+}
+
+async function loadTxs() {
+  try {
+    const q = $('txQ')?.value || '';
+    const st = $('txSt')?.value || '';
+    const j = await (await fetch(`/api/transactions?page=${txPage}&search=${encodeURIComponent(q)}&status=${st}`)).json();
+    const p = j.pagination;
+    $('txPag').textContent = `Página ${p.page}/${p.totalPages} (${p.totalRecords} total)`;
+    $('txTbl').innerHTML = j.data.map(t => {
+      const c = t.customer || {};
+      const st = t.status==='paid'?'tag-g':'tag-a';
+      const stL = t.status==='paid'?'Pago':t.status==='waiting_payment'?'Pendente':t.status;
+      return `<tr>
+        <td style="font-size:12px;color:var(--dim)">${new Date(t.createdAt).toLocaleString('pt-BR')}</td>
+        <td><b>${esc(c.name||'-')}</b></td>
+        <td style="font-family:monospace;font-size:12px">${esc(c.phone||'-')}</td>
+        <td style="font-size:12px;color:var(--dim)">${esc(c.email||'-')}</td>
+        <td style="font-size:12px">${esc(t.items?.[0]?.title||'-').substring(0,40)}</td>
+        <td style="color:var(--green);font-weight:600">${fmt((t.amount||0)/100)}</td>
+        <td><span class="tag ${st}">${stL}</span></td>
+        <td>${t.status==='paid'?`<button class="btn btn-s" style="padding:3px 8px;font-size:11px" onclick="sendCRM('${t.id}')">📤</button>`:''}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+
+async function loadLogs() {
+  try {
+    const logs = await (await fetch('/api/logs')).json();
+    $('logBox').innerHTML = logs.map(l => `<div><span class="t">${new Date(l.time).toLocaleTimeString('pt-BR')}</span>${esc(l.msg)}</div>`).join('');
+  } catch(e) {}
+}
+
+async function sendCRM(id) {
+  toast('Enviando...');
+  try {
+    const j = await (await fetch(`/api/crm/send/${id}`, {method:'POST'})).json();
+    if (j.success) toast('✓ Enviado ao CRM!');
+    else toast('Erro: ' + (j.error || j.status || 'falha'));
+  } catch(e) { toast('Erro: ' + e.message); }
+}
+
+async function refresh() {
+  toast('Atualizando...');
+  await fetch('/api/refresh', {method:'POST'});
+  toast('✓ Atualizado');
+  loadAll();
+}
+
+function loadAll() { loadStats(); loadLeads(); }
+loadAll();
+setInterval(loadAll, 15000);
 </script>
 </body>
 </html>
