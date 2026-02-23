@@ -298,14 +298,15 @@ async function fetchNewTransactions() {
 // ═══════════════════════════════════════
 
 function buildCRMPayload(tx) {
-  const phone = validatePhoneBR(tx.customer?.phone);
+  const cust = extractCustomer(tx);
+  const phone = validatePhoneBR(cust.phone);
   return {
     event: 'venda_paga', timestamp: new Date().toISOString(),
     lead: {
-      nome: tx.customer?.name || '', email: tx.customer?.email || '',
-      telefone: phone.formatted || tx.customer?.phone || '',
+      nome: cust.name, email: cust.email,
+      telefone: phone.formatted || cust.phone,
       telefone_valido: phone.valid, telefone_whatsapp: phone.whatsapp || '',
-      documento: tx.customer?.document?.number || '',
+      documento: cust.document,
     },
     transacao: {
       id: tx.id, produto: tx.items?.[0]?.title || '',
@@ -319,13 +320,17 @@ function buildCRMPayload(tx) {
 async function sendLeadToCRM(tx) {
   if (!CONFIG.CRM_WEBHOOK_URL) return false;
   if (leadsSent[tx.id]) return true;
-  const name = tx.customer?.name || 'Desconhecido';
+  const cust = extractCustomer(tx);
+  const name = cust.name || 'Desconhecido';
   const amount = ((tx.amount||0)/100).toFixed(2);
+  const payload = buildCRMPayload(tx);
+  
+  addLog('info', `CRM ← ${name} | Tel: ${cust.phone || 'sem'} | R$ ${amount}`);
+  
   try {
-    addLog('info', `CRM ← ${name} R$ ${amount}`);
     const res = await fetch(CONFIG.CRM_WEBHOOK_URL, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(buildCRMPayload(tx)), timeout: 15000,
+      body: JSON.stringify(payload), timeout: 15000,
     });
     const text = await res.text().catch(() => '');
     if (res.ok) {
@@ -337,7 +342,7 @@ async function sendLeadToCRM(tx) {
     } else {
       leadsSent[tx.id] = { sentAt: new Date().toISOString(), ok: false, error: `${res.status}` };
       await saveJSON(FILES.leads, leadsSent);
-      addLog('error', `CRM erro ${res.status}: ${text.substring(0,100)}`);
+      addLog('error', `CRM erro ${res.status}: ${text.substring(0,200)}`);
       return false;
     }
   } catch (e) { addLog('error', `CRM falhou: ${e.message}`); return false; }
@@ -350,13 +355,14 @@ async function sendLeadToCRM(tx) {
 function getLeads(txs, phoneFilter) {
   const map = {};
   txs.forEach(t => {
-    const key = t.customer?.document?.number || t.customer?.email || t.customer?.name;
+    const cust = extractCustomer(t);
+    const key = cust.document || cust.email || cust.name;
     if (!key) return;
     if (!map[key]) {
-      const phone = validatePhoneBR(t.customer?.phone);
+      const phone = validatePhoneBR(cust.phone);
       map[key] = {
-        document: t.customer?.document?.number || '', name: t.customer?.name || '',
-        email: t.customer?.email || '', phoneRaw: t.customer?.phone || '',
+        document: cust.document, name: cust.name,
+        email: cust.email, phoneRaw: cust.phone,
         phoneFormatted: phone.formatted, phoneValid: phone.valid,
         phoneType: phone.reason, whatsapp: phone.whatsapp || '',
         firstPurchase: t.createdAt, lastPurchase: t.createdAt,
@@ -392,7 +398,10 @@ function applyFilters(txs, filters) {
   if (filters.paymentMethod && filters.paymentMethod !== 'all') r = r.filter(t => t.paymentMethod === filters.paymentMethod);
   if (filters.search) {
     const q = filters.search.toLowerCase();
-    r = r.filter(t => (t.customer?.name||'').toLowerCase().includes(q) || (t.customer?.email||'').toLowerCase().includes(q) || (t.customer?.document?.number||'').includes(q) || (t.customer?.phone||'').includes(q) || (t.id||'').toLowerCase().includes(q));
+    r = r.filter(t => {
+      const c = extractCustomer(t);
+      return c.name.toLowerCase().includes(q) || c.email.toLowerCase().includes(q) || c.document.includes(q) || c.phone.includes(q) || (t.id||'').toLowerCase().includes(q);
+    });
   }
   return r;
 }
@@ -404,10 +413,11 @@ function getStats(txs) {
   const phoneStats = { valid: 0, invalid: 0, empty: 0, whatsapp: 0 };
   const seen = new Set();
   txs.forEach(t => {
-    const key = t.customer?.document?.number || t.customer?.email;
+    const cust = extractCustomer(t);
+    const key = cust.document || cust.email;
     if (!key || seen.has(key)) return; seen.add(key);
-    if (!t.customer?.phone) { phoneStats.empty++; return; }
-    const v = validatePhoneBR(t.customer.phone);
+    if (!cust.phone) { phoneStats.empty++; return; }
+    const v = validatePhoneBR(cust.phone);
     if (v.valid) { phoneStats.valid++; if (v.whatsapp) phoneStats.whatsapp++; }
     else phoneStats.invalid++;
   });
@@ -455,15 +465,16 @@ app.get('/api/leads', (req, res) => {
 app.get('/api/sales', (req, res) => {
   const txs = applyFilters(txCache.data, req.query);
   res.json(txs.filter(t => t.status === 'paid').map(t => {
-    const ph = validatePhoneBR(t.customer?.phone);
+    const cust = extractCustomer(t);
+    const ph = validatePhoneBR(cust.phone);
     return {
-      id: t.id, date: t.createdAt, customer: t.customer?.name||'N/A',
-      email: t.customer?.email||'N/A', phone: ph.formatted || t.customer?.phone||'N/A',
-      phoneValid: ph.valid, whatsapp: ph.whatsapp||'',
-      document: t.customer?.document?.number||'N/A', product: t.items?.[0]?.title||'N/A',
+      id: t.id, date: t.createdAt, customer: cust.name || 'N/A',
+      email: cust.email || 'N/A', phone: ph.formatted || cust.phone || 'N/A',
+      phoneValid: ph.valid, whatsapp: ph.whatsapp || '',
+      document: cust.document || 'N/A', product: t.items?.[0]?.title || 'N/A',
       amount: (t.amount||0)/100, netAmount: (t.fee?.netAmount||0)/100,
-      method: t.paymentMethod||'N/A', installments: t.installments||1,
-      crmStatus: leadsSent[t.id] ? 'sent' : 'pending', crmSentAt: leadsSent[t.id]?.sentAt||null,
+      method: t.paymentMethod || 'N/A', installments: t.installments || 1,
+      crmStatus: leadsSent[t.id] ? 'sent' : 'pending', crmSentAt: leadsSent[t.id]?.sentAt || null,
     };
   }));
 });
@@ -474,7 +485,90 @@ app.get('/api/products', (req, res) => {
   res.json(Array.from(p).sort());
 });
 
-app.get('/api/logs', (req, res) => res.json(systemLogs.slice(0, parseInt(req.query.limit)||100)));
+// ═══════════════════════════════════════
+//  EXTRAÇÃO INTELIGENTE DE DADOS DO CLIENTE
+//  A API pode ter campos com nomes diferentes
+// ═══════════════════════════════════════
+
+function extractCustomer(tx) {
+  const c = tx.customer || tx.buyer || tx.payer || tx.client || {};
+  
+  // Nome - tentar vários campos
+  const name = c.name || c.nome || c.fullName || c.full_name
+    || c.firstName && c.lastName ? `${c.firstName} ${c.lastName}` : ''
+    || c.first_name && c.last_name ? `${c.first_name} ${c.last_name}` : ''
+    || tx.customerName || tx.customer_name || tx.buyerName || '';
+
+  // Email
+  const email = c.email || c.emailAddress || c.email_address
+    || tx.customerEmail || tx.customer_email || '';
+
+  // Telefone - tentar MUITOS campos possíveis
+  const phone = c.phone || c.phoneNumber || c.phone_number
+    || c.cellphone || c.cellPhone || c.cell_phone
+    || c.mobile || c.mobilePhone || c.mobile_phone
+    || c.telefone || c.celular || c.fone
+    || c.phones?.[0]?.number || c.phones?.[0]
+    || c.phoneNumbers?.[0]?.number || c.phoneNumbers?.[0]
+    || tx.customerPhone || tx.customer_phone || '';
+
+  // Documento
+  const document = c.document?.number || c.document?.value || c.document
+    || c.cpf || c.cnpj || c.documentNumber || c.document_number
+    || c.taxId || c.tax_id || c.registro
+    || tx.customerDocument || '';
+
+  // Garantir que document é string
+  const docStr = typeof document === 'object' ? (document?.number || document?.value || JSON.stringify(document)) : String(document || '');
+
+  return { name: String(name || ''), email: String(email || ''), phone: String(phone || ''), document: docStr };
+}
+
+// Debug endpoint — mostra estrutura RAW de uma transação
+app.get('/api/debug-tx', (req, res) => {
+  if (txCache.data.length === 0) return res.json({ error: 'Sem dados no cache' });
+  // Pegar uma transação paga com customer
+  const sample = txCache.data.find(t => t.status === 'paid' && t.customer) || txCache.data[0];
+  const extracted = extractCustomer(sample);
+  res.json({
+    _info: 'Dados RAW da transação pra debug',
+    transactionKeys: Object.keys(sample),
+    customerRaw: sample.customer || sample.buyer || sample.payer || 'NENHUM CAMPO CUSTOMER',
+    customerKeys: sample.customer ? Object.keys(sample.customer) : 'N/A',
+    extracted,
+    phoneValidation: validatePhoneBR(extracted.phone),
+    sampleId: sample.id,
+    sampleStatus: sample.status,
+  });
+});
+
+// Listar os campos de TODAS as transações pra encontrar onde está o telefone
+app.get('/api/debug-fields', (req, res) => {
+  const fieldCount = {};
+  const customerFieldCount = {};
+  const phoneSamples = [];
+
+  txCache.data.slice(0, 200).forEach(tx => {
+    Object.keys(tx).forEach(k => { fieldCount[k] = (fieldCount[k] || 0) + 1; });
+    const c = tx.customer || tx.buyer || tx.payer || {};
+    if (typeof c === 'object' && c !== null) {
+      Object.keys(c).forEach(k => { customerFieldCount[k] = (customerFieldCount[k] || 0) + 1; });
+    }
+    // Procurar qualquer campo que pareça telefone
+    const extracted = extractCustomer(tx);
+    if (extracted.phone && phoneSamples.length < 5) {
+      phoneSamples.push({ id: tx.id, phone: extracted.phone, name: extracted.name });
+    }
+  });
+
+  res.json({
+    _info: 'Campos encontrados nas transações (200 primeiras)',
+    transactionFields: fieldCount,
+    customerFields: customerFieldCount,
+    phoneSamples,
+    totalTransactions: txCache.data.length,
+  });
+});
 app.get('/api/validate-phone/:phone', (req, res) => res.json(validatePhoneBR(req.params.phone)));
 
 // CRM — SÓ MANUAL (aceita rota nova E antiga)
@@ -513,7 +607,7 @@ app.post('/api/transactions/send-all', async (req, res) => {
 app.post('/api/crm/send-valid', async (req, res) => {
   const paid = txCache.data.filter(t => {
     if (t.status !== 'paid' || leadsSent[t.id]) return false;
-    return validatePhoneBR(t.customer?.phone).valid;
+    return validatePhoneBR(extractCustomer(t).phone).valid;
   });
   if (!paid.length) return res.json({ success: true, sent: 0, total: 0 });
   addLog('info', `Enviando ${paid.length} leads com telefone válido...`);
@@ -521,6 +615,8 @@ app.post('/api/crm/send-valid', async (req, res) => {
   for (const tx of paid) { if (await sendLeadToCRM(tx)) sent++; await delay(300); }
   res.json({ success: true, sent, total: paid.length });
 });
+
+app.get('/api/logs', (req, res) => res.json(systemLogs.slice(0, parseInt(req.query.limit)||100)));
 app.post('/api/crm/test', async (req, res) => {
   try {
     const r = await fetch(CONFIG.CRM_WEBHOOK_URL, {
