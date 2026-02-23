@@ -1,0 +1,18 @@
+{
+  "name": "dhr-lead-capture",
+  "version": "1.0.0",
+  "description": "Sistema de captura de leads pagos DHR Gateway → CRM DataCrazy",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "better-sqlite3": "^9.4.3",
+    "node-fetch": "^2.7.0",
+    "ws": "^8.16.0",
+    "dotenv": "^16.3.1",
+    "crypto": "^1.0.1"
+  }
+}
