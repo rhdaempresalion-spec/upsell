@@ -8,7 +8,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PK = 'pk_WNNg2i_r8_iqeG3XrdJFI_q1I8ihd1yLoUa08Ip0LKaqxXxE';
 const SK = 'sk_jz1yyIaa0Dw2OWhMH0r16gUgWZ7N2PCpb6aK1crKPIFq02aD';
 const API = 'https://api.shieldtecnologia.com/v1';
-const CRM = 'https://api.datacrazy.io/v1/crm/api/crm/flows/webhooks/a3161e6d-6f4d-4b16-a1b5-16bcb9641994/76e41ac2-564a-4ff6-9e28-ceee490c6544';
+const CRM = 'https://api.datacrazy.io/v1/crm/api/crm/flows/webhooks/a3161e6d-6f4d-4b16-a1b5-16bcb9641994/560e62f9-9a1c-4e95-8afe-99794f66f1a8';
 const AUTH = 'Basic ' + Buffer.from(`${PK}:${SK}`).toString('base64');
 const PORT = process.env.PORT || 3005;
 
