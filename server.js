@@ -1,511 +1,469 @@
 // ═══════════════════════════════════════════════════════════════
-//  DHR Lead Capture System - Backend Server
-//  Busca transações na API Shield + Recebe Webhooks → CRM
+//  DHR Lead Capture → CRM DataCrazy
+//  Conexão IDÊNTICA ao projeto funcionando:
+//    Auth: Basic pk:sk
+//    Endpoint: GET /transactions?page=X&pageSize=Y
 // ═══════════════════════════════════════════════════════════════
 
-require('dotenv').config();
-const express = require('express');
-const Database = require('better-sqlite3');
-const fetch = require('node-fetch');
-const { WebSocketServer } = require('ws');
-const crypto = require('crypto');
-const path = require('path');
-const http = require('http');
-const fs = require('fs');
+import express from 'express';
+import fetch from 'node-fetch';
+import fs from 'fs/promises';
+import path from 'path';
+import http from 'http';
+import { fileURLToPath } from 'url';
+import { WebSocketServer } from 'ws';
+import { decodePIX } from './pix-decoder.js';
 
-// ─── Config ───
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const CONFIG = {
-  port: process.env.PORT || 3000,
-  dhr: {
-    baseUrl: (process.env.DHR_BASE_URL || 'https://api.shieldtecnologia.com/v1').replace(/\/+$/, ''),
-    pk: process.env.DHR_PUBLIC_KEY || '',
-    sk: process.env.DHR_SECRET_KEY || '',
-  },
-  crm: { url: process.env.CRM_WEBHOOK_URL || '' },
-  pollInterval: (parseInt(process.env.POLL_INTERVAL) || 30) * 1000,
-  autoSendCRM: process.env.AUTO_SEND_CRM !== 'false',
+  PORT: process.env.PORT || 3005,
+  DHR_PUBLIC_KEY: process.env.DHR_PUBLIC_KEY || 'pk_WNNg2i_r8_iqeG3XrdJFI_q1I8ihd1yLoUa08Ip0LKaqxXxE',
+  DHR_SECRET_KEY: process.env.DHR_SECRET_KEY || 'sk_jz1yyIaa0Dw2OWhMH0r16gUgWZ7N2PCpb6aK1crKPIFq02aD',
+  DHR_API_URL: process.env.DHR_API_URL || 'https://api.shieldtecnologia.com/v1',
+  CRM_WEBHOOK_URL: process.env.CRM_WEBHOOK_URL || 'https://api.datacrazy.io/v1/crm/api/crm/flows/webhooks/a3161e6d-6f4d-4b16-a1b5-16bcb9641994/76e41ac2-564a-4ff6-9e28-ceee490c6544',
+  POLL_INTERVAL: 10000,
+  AUTO_SEND_CRM: true,
+  MAX_RETRIES: 3,
+  RETRY_DELAY: 2000,
 };
 
-// ═══════════════════════════════════════
-//  Assinatura HMAC-SHA512 (Shield/Solidgate pattern)
-// ═══════════════════════════════════════
-function makeSignature(body = '') {
-  const data = body ? (CONFIG.dhr.pk + body + CONFIG.dhr.pk) : (CONFIG.dhr.pk + CONFIG.dhr.pk);
-  const hex = crypto.createHmac('sha512', CONFIG.dhr.sk).update(data).digest('hex');
-  return Buffer.from(hex).toString('base64');
-}
-
-// Gera headers em vários formatos de auth pra tentar
-function authSets(bodyStr = '') {
-  const sig = makeSignature(bodyStr);
-  return [
-    // 1) Bearer com secret key (mais comum)
-    { name: 'Bearer-SK', headers: { 'Authorization': `Bearer ${CONFIG.dhr.sk}` } },
-    // 2) HMAC signature (Solidgate/Shield style)
-    { name: 'HMAC-Sig', headers: { 'public-key': CONFIG.dhr.pk, 'signature': sig } },
-    // 3) Basic auth pk:sk
-    { name: 'Basic', headers: { 'Authorization': 'Basic ' + Buffer.from(CONFIG.dhr.pk + ':' + CONFIG.dhr.sk).toString('base64') } },
-    // 4) X-Api-Key
-    { name: 'X-Api-Key', headers: { 'X-Api-Key': CONFIG.dhr.sk } },
-    // 5) Bearer com public key
-    { name: 'Bearer-PK', headers: { 'Authorization': `Bearer ${CONFIG.dhr.pk}` } },
-    // 6) Public + Secret headers
-    { name: 'PK+SK', headers: { 'public-key': CONFIG.dhr.pk, 'secret-key': CONFIG.dhr.sk } },
-    // 7) Token header
-    { name: 'Token', headers: { 'Token': CONFIG.dhr.sk } },
-    // 8) Merchant style
-    { name: 'Merchant', headers: { 'merchant-id': CONFIG.dhr.pk, 'Authorization': `Bearer ${CONFIG.dhr.sk}` } },
-  ];
-}
-
-// ─── Find HTML ───
-function findHtml() {
-  for (const p of [
-    path.join(__dirname, 'public', 'index.html'),
-    path.join(process.cwd(), 'public', 'index.html'),
-    '/app/public/index.html',
-    path.join(__dirname, 'index.html'),
-  ]) { try { if (fs.existsSync(p)) return fs.readFileSync(p, 'utf-8'); } catch(e) {} }
-  return null;
-}
-let HTML = findHtml();
-
-// ─── Database ───
-const db = new Database(path.join(__dirname, 'leads.db'));
-db.pragma('journal_mode = WAL');
-db.exec(`
-  CREATE TABLE IF NOT EXISTS transactions (
-    id TEXT PRIMARY KEY, customer_name TEXT, customer_email TEXT,
-    customer_phone TEXT, customer_document TEXT, product TEXT,
-    amount REAL, payment_method TEXT, status TEXT, dhr_status TEXT,
-    created_at TEXT, received_at TEXT DEFAULT (datetime('now')),
-    sent_to_crm INTEGER DEFAULT 0, sent_at TEXT, crm_response TEXT, raw_data TEXT
-  );
-  CREATE TABLE IF NOT EXISTS logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, message TEXT, data TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
-  CREATE INDEX IF NOT EXISTS idx_st ON transactions(status);
-  CREATE INDEX IF NOT EXISTS idx_crm ON transactions(sent_to_crm);
-`);
-
-const Q = {
-  ins: db.prepare(`INSERT OR IGNORE INTO transactions (id,customer_name,customer_email,customer_phone,customer_document,product,amount,payment_method,status,dhr_status,created_at,raw_data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`),
-  upCrm: db.prepare(`UPDATE transactions SET sent_to_crm=1, sent_at=datetime('now'), crm_response=? WHERE id=?`),
-  get: db.prepare('SELECT * FROM transactions WHERE id=?'),
-  all: db.prepare('SELECT * FROM transactions ORDER BY created_at DESC LIMIT ?'),
-  pending: db.prepare("SELECT * FROM transactions WHERE status='paid' AND sent_to_crm=0"),
-  stats: db.prepare(`SELECT COUNT(*) as total, SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END) as paid, SUM(CASE WHEN sent_to_crm=1 THEN 1 ELSE 0 END) as sent, SUM(CASE WHEN status='paid' THEN amount ELSE 0 END) as revenue FROM transactions`),
-  log: db.prepare('INSERT INTO logs (type,message,data) VALUES (?,?,?)'),
-  logs: db.prepare('SELECT * FROM logs ORDER BY created_at DESC LIMIT ?'),
-  getS: db.prepare('SELECT value FROM settings WHERE key=?'),
-  setS: db.prepare('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)'),
+const FILES = {
+  cache: path.join(__dirname, 'transactions_cache.json'),
+  leads: path.join(__dirname, 'leads_sent.json'),
 };
 
-// ─── Logger + WS ───
-let wss; const clients = new Set();
-function broadcast(d) { const m = JSON.stringify(d); clients.forEach(ws => { if (ws.readyState === 1) ws.send(m); }); }
-function log(type, msg, data = null) {
-  const t = new Date().toISOString();
-  console.log(`[${t}] [${type.toUpperCase()}] ${msg}`);
-  try { Q.log.run(type, msg, data ? JSON.stringify(data) : null); } catch(e) {}
-  broadcast({ type: 'log', payload: { type, message: msg, time: t } });
+// ─── STATE ───
+let txCache = { data: [], lastUpdate: 0, isLoading: false };
+let leadsSent = {};
+let systemLogs = [];
+const wsClients = new Set();
+
+// ═══════════════════════════════════════
+//  UTILITÁRIOS
+// ═══════════════════════════════════════
+
+async function loadJSON(filepath, fallback) {
+  try { return JSON.parse(await fs.readFile(filepath, 'utf-8')); }
+  catch { return fallback; }
+}
+
+async function saveJSON(filepath, data) {
+  try { await fs.writeFile(filepath, JSON.stringify(data)); }
+  catch (e) { console.error(`Erro salvando ${filepath}:`, e.message); }
+}
+
+function broadcast(msg) {
+  const str = JSON.stringify(msg);
+  wsClients.forEach(ws => { if (ws.readyState === 1) ws.send(str); });
+}
+
+function addLog(type, message) {
+  const entry = { type, message, time: new Date().toISOString() };
+  const icon = type === 'success' ? '✅' : type === 'error' ? '❌' : 'ℹ️';
+  console.log(`${icon} ${message}`);
+  systemLogs.unshift(entry);
+  if (systemLogs.length > 500) systemLogs.length = 500;
+  broadcast({ type: 'log', payload: entry });
+}
+
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ═══════════════════════════════════════
+//  SHIELD API — CONEXÃO IDÊNTICA AO PROJETO QUE FUNCIONA
+//  Auth: Basic base64(pk:sk)
+//  Endpoint: GET /transactions?page=X&pageSize=Y
+// ═══════════════════════════════════════
+
+function getAuth() {
+  return 'Basic ' + Buffer.from(`${CONFIG.DHR_PUBLIC_KEY}:${CONFIG.DHR_SECRET_KEY}`).toString('base64');
+}
+
+async function fetchDHR(endpoint, retries = CONFIG.MAX_RETRIES) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const url = `${CONFIG.DHR_API_URL}${endpoint}`;
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': getAuth(),
+          'Connection': 'keep-alive'
+        },
+        timeout: 30000,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      return await response.json();
+    } catch (error) {
+      if (attempt === retries) throw error;
+      await delay(CONFIG.RETRY_DELAY);
+    }
+  }
+}
+
+// Buscar TODAS as transações (primeira vez ou rebuild)
+async function fetchAllTransactions() {
+  if (txCache.isLoading) {
+    addLog('info', 'Busca já em andamento, ignorando...');
+    return txCache.data;
+  }
+
+  txCache.isLoading = true;
+  addLog('info', 'Buscando TODAS as transações da API Shield...');
+  broadcast({ type: 'loading', payload: true });
+
+  let allTransactions = [];
+  const pageSize = 500;
+
+  try {
+    // Primeira página pra descobrir total
+    const firstData = await fetchDHR(`/transactions?page=1&pageSize=${pageSize}`);
+    const firstTransactions = firstData.data || [];
+    const pagination = firstData.pagination || {};
+    const totalPages = pagination.totalPages || 1;
+    const totalRecords = pagination.totalRecords || 0;
+
+    addLog('info', `Total: ${totalRecords} transações em ${totalPages} páginas`);
+    allTransactions = [...firstTransactions];
+
+    // Buscar restante em lotes de 10 paralelas
+    if (totalPages > 1) {
+      const remainingPages = [];
+      for (let p = 2; p <= totalPages; p++) remainingPages.push(p);
+
+      const batchSize = 10;
+      for (let i = 0; i < remainingPages.length; i += batchSize) {
+        const batch = remainingPages.slice(i, i + batchSize);
+        const promises = batch.map(p => fetchDHR(`/transactions?page=${p}&pageSize=${pageSize}`));
+        const results = await Promise.all(promises);
+        results.forEach(data => {
+          if (data.data) allTransactions = allTransactions.concat(data.data);
+        });
+
+        const progress = Math.min(100, Math.round((i + batchSize) / remainingPages.length * 100));
+        addLog('info', `Progresso: ${progress}% (${allTransactions.length} transações)`);
+      }
+    }
+
+    // Ordenar mais recente primeiro
+    allTransactions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    // Salvar no cache
+    txCache.data = allTransactions;
+    txCache.lastUpdate = Date.now();
+    txCache.isLoading = false;
+
+    await saveJSON(FILES.cache, { data: allTransactions, lastUpdate: txCache.lastUpdate });
+    addLog('success', `Cache completo: ${allTransactions.length} transações`);
+
+    broadcast({ type: 'loading', payload: false });
+    broadcast({ type: 'new_transactions', payload: { count: allTransactions.length } });
+
+    // Auto-enviar leads pagos que ainda não foram enviados
+    if (CONFIG.AUTO_SEND_CRM) await autoSendNewLeads();
+
+    return allTransactions;
+
+  } catch (err) {
+    txCache.isLoading = false;
+    addLog('error', `Erro ao buscar transações: ${err.message}`);
+    broadcast({ type: 'loading', payload: false });
+    return txCache.data;
+  }
+}
+
+// Buscar apenas transações NOVAS (incremental, rápido)
+async function fetchNewTransactions() {
+  if (txCache.isLoading) return;
+  if (txCache.data.length === 0) {
+    return await fetchAllTransactions();
+  }
+
+  txCache.isLoading = true;
+
+  try {
+    const data = await fetchDHR('/transactions?page=1&pageSize=100');
+    const newTxs = data.data || [];
+
+    if (newTxs.length === 0) {
+      txCache.isLoading = false;
+      return;
+    }
+
+    // Encontrar transações novas
+    const existingIds = new Set(txCache.data.map(t => t.id));
+    const brandNew = newTxs.filter(t => !existingIds.has(t.id));
+
+    if (brandNew.length > 0) {
+      addLog('success', `🆕 ${brandNew.length} novas transações encontradas!`);
+      txCache.data = [...brandNew, ...txCache.data];
+      txCache.lastUpdate = Date.now();
+      await saveJSON(FILES.cache, { data: txCache.data, lastUpdate: txCache.lastUpdate });
+      broadcast({ type: 'new_transactions', payload: { count: brandNew.length } });
+
+      // Enviar leads pagos novos ao CRM
+      if (CONFIG.AUTO_SEND_CRM) {
+        for (const tx of brandNew) {
+          if (tx.status === 'paid' && !leadsSent[tx.id]) {
+            await sendLeadToCRM(tx);
+          }
+        }
+      }
+    }
+
+    // Checar mudanças de status (ex: pending → paid)
+    let updated = 0;
+    for (const newTx of newTxs) {
+      const existing = txCache.data.find(t => t.id === newTx.id);
+      if (existing && existing.status !== newTx.status) {
+        const oldStatus = existing.status;
+        Object.assign(existing, newTx);
+        updated++;
+        if (newTx.status === 'paid' && oldStatus !== 'paid' && !leadsSent[newTx.id]) {
+          addLog('info', `Transação ${newTx.id}: ${oldStatus} → paid`);
+          if (CONFIG.AUTO_SEND_CRM) await sendLeadToCRM(newTx);
+        }
+      }
+    }
+
+    if (updated > 0) {
+      addLog('info', `${updated} transações atualizadas`);
+      await saveJSON(FILES.cache, { data: txCache.data, lastUpdate: txCache.lastUpdate });
+    }
+
+  } catch (err) {
+    addLog('error', `Erro busca incremental: ${err.message}`);
+  }
+
+  txCache.isLoading = false;
 }
 
 // ═══════════════════════════════════════
-//  SHIELD API - Buscar Transações (POLLING)
+//  CRM DATACRAZY
 // ═══════════════════════════════════════
 
-// Endpoints pra tentar (do mais comum ao menos)
-const API_ENDPOINTS = [
-  '/transactions', '/transaction',
-  '/charges', '/charge',
-  '/payments', '/payment',
-  '/orders', '/order',
-  '/sales', '/sale',
-  '/invoices', '/invoice',
-  '/subscriptions',
-];
-
-// Query params pra tentar
-const QUERY_PATTERNS = [
-  '?page=1&status=paid',
-  '?page=1&filter[status]=paid',
-  '?page=1',
-  '?status=paid&limit=50',
-  '?limit=50',
-  '',
-];
-
-async function tryRequest(url, headers, method = 'GET', body = null) {
-  try {
-    const opts = {
-      method,
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', ...headers },
-      timeout: 10000,
-    };
-    if (body) opts.body = typeof body === 'string' ? body : JSON.stringify(body);
-    const res = await fetch(url, opts);
-    const text = await res.text();
-
-    // Se retorna HTML é 404 page, ignora
-    if (text.includes('<!DOCTYPE') || text.includes('<html')) {
-      return { ok: false, status: res.status, html: true };
-    }
-
-    let data;
-    try { data = JSON.parse(text); } catch(e) { data = text; }
-
-    return { ok: res.ok, status: res.status, data, text: text.substring(0, 300) };
-  } catch (e) {
-    return { ok: false, status: 'ERR', error: e.message };
-  }
-}
-
-// Endpoint que já sabemos que funciona (salvo em settings)
-let workingConfig = null; // { endpoint, query, auth, method }
-
-async function fetchTransactions() {
-  const base = CONFIG.dhr.baseUrl;
-
-  // 1) Se já temos endpoint que funciona, usa direto
-  if (workingConfig) {
-    const url = `${base}${workingConfig.endpoint}${workingConfig.query}`;
-    const auths = authSets();
-    const auth = auths.find(a => a.name === workingConfig.auth) || auths[0];
-    const body = workingConfig.method === 'POST' ? JSON.stringify({ page: 1, status: 'paid', per_page: 50 }) : null;
-    const r = await tryRequest(url, auth.headers, workingConfig.method, body);
-
-    if (r.ok) {
-      log('success', `Endpoint ${workingConfig.method} ${workingConfig.endpoint} [${workingConfig.auth}] → ${r.status}`);
-      return r.data;
-    }
-    // Se parou de funcionar, reseta
-    log('info', `Endpoint salvo parou de funcionar (${r.status}), redescobring...`);
-    workingConfig = null;
-  }
-
-  // 2) Tenta restaurar de settings
-  try {
-    const saved = Q.getS.get('working_config');
-    if (saved && !workingConfig) {
-      workingConfig = JSON.parse(saved.value);
-      return await fetchTransactions(); // recursão 1x
-    }
-  } catch(e) {}
-
-  // 3) Descobre endpoint — testa tudo
-  log('info', 'Descobrindo endpoints da API Shield...');
-
-  for (const authSet of authSets()) {
-    for (const ep of API_ENDPOINTS) {
-      // GET com vários query patterns
-      for (const qp of QUERY_PATTERNS) {
-        const url = `${base}${ep}${qp}`;
-        const r = await tryRequest(url, authSet.headers, 'GET');
-
-        if (r.ok) {
-          log('success', `✓ ENCONTRADO: GET ${ep}${qp} [${authSet.name}] → ${r.status}`);
-          workingConfig = { endpoint: ep, query: qp, auth: authSet.name, method: 'GET' };
-          Q.setS.run('working_config', JSON.stringify(workingConfig));
-          return r.data;
-        }
-
-        if (r.status === 401 || r.status === 403) {
-          log('info', `${ep} [${authSet.name}] → ${r.status} (auth rejeitada)`);
-          break; // pula pra próxima auth nesse endpoint
-        }
-
-        if (!r.html && r.status !== 404 && r.status !== 'ERR') {
-          log('info', `${ep}${qp} [${authSet.name}] → ${r.status}: ${r.text || r.error || ''}`);
-        }
-      }
-
-      // POST (alguns gateways usam POST pra listar)
-      const postBody = JSON.stringify({ page: 1, status: 'paid', per_page: 50, limit: 50 });
-      const rp = await tryRequest(`${base}${ep}`, authSet.headers, 'POST', postBody);
-      if (rp.ok) {
-        log('success', `✓ ENCONTRADO: POST ${ep} [${authSet.name}] → ${rp.status}`);
-        workingConfig = { endpoint: ep, query: '', auth: authSet.name, method: 'POST' };
-        Q.setS.run('working_config', JSON.stringify(workingConfig));
-        return rp.data;
-      }
-
-      // POST /list pattern
-      const rl = await tryRequest(`${base}${ep}/list`, authSet.headers, 'POST', postBody);
-      if (rl.ok) {
-        log('success', `✓ ENCONTRADO: POST ${ep}/list [${authSet.name}] → ${rl.status}`);
-        workingConfig = { endpoint: `${ep}/list`, query: '', auth: authSet.name, method: 'POST' };
-        Q.setS.run('working_config', JSON.stringify(workingConfig));
-        return rl.data;
-      }
-    }
-  }
-
-  log('error', 'Nenhum endpoint da API Shield respondeu. Verifique a documentação ou use webhooks.');
-  return null;
-}
-
-// ─── Normalizar transação ───
-function normalize(raw) {
-  const tx = raw.data || raw.transaction || raw.charge || raw.payment || raw;
+function buildCRMPayload(tx) {
   return {
-    id: tx.id || tx.transaction_id || tx.charge_id || tx.code || `dhr_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,
-    customer_name: tx.customer?.name || tx.buyer?.name || tx.payer?.name || tx.name || '',
-    customer_email: tx.customer?.email || tx.buyer?.email || tx.payer?.email || tx.email || '',
-    customer_phone: tx.customer?.phone || tx.customer?.phone_number || tx.customer?.cellphone || tx.buyer?.phone || tx.phone || tx.cellphone || '',
-    customer_document: tx.customer?.document || tx.customer?.cpf || tx.customer?.document_number || tx.buyer?.cpf || tx.cpf || tx.document || '',
-    product: tx.product?.name || tx.items?.[0]?.name || tx.description || tx.product_name || tx.offer?.name || tx.plan?.name || '',
-    amount: parseAmount(tx.amount || tx.value || tx.total || tx.price || 0),
-    payment_method: tx.payment_method || tx.method || tx.type || tx.payment?.method || 'unknown',
-    status: normStatus(tx.status || tx.payment_status || tx.payment?.status || ''),
-    dhr_status: tx.status || '',
-    created_at: tx.created_at || tx.paid_at || tx.date || tx.createdAt || tx.updated_at || new Date().toISOString(),
+    event: 'venda_paga',
+    timestamp: new Date().toISOString(),
+    lead: {
+      nome: tx.customer?.name || '',
+      email: tx.customer?.email || '',
+      telefone: tx.customer?.phone || '',
+      documento: tx.customer?.document?.number || '',
+    },
+    transacao: {
+      id: tx.id,
+      produto: tx.items?.[0]?.title || '',
+      valor: (tx.amount || 0) / 100,
+      valor_liquido: (tx.fee?.netAmount || 0) / 100,
+      metodo_pagamento: tx.paymentMethod || '',
+      parcelas: tx.installments || 1,
+      data_pagamento: tx.createdAt,
+      status: tx.status,
+    },
   };
 }
 
-function parseAmount(v) {
-  if (typeof v === 'string') v = parseFloat(v.replace(/[^\d.,]/g, '').replace(',', '.'));
-  if (isNaN(v)) return 0;
-  return v > 10000 ? v / 100 : v;
-}
+async function sendLeadToCRM(tx) {
+  if (!CONFIG.CRM_WEBHOOK_URL) return false;
+  if (leadsSent[tx.id]) return true;
 
-function normStatus(s) {
-  const str = String(s).toLowerCase();
-  if (['paid','approved','confirmed','completed','captured','autorizado','pago','aprovado','active','succeeded'].some(k => str.includes(k))) return 'paid';
-  if (['refund','reversed','estornado','reembolsado'].some(k => str.includes(k))) return 'refunded';
-  if (['pending','waiting','pendente','aguardando','processing','created'].some(k => str.includes(k))) return 'pending';
-  if (['failed','denied','declined','negado','recusado','refused'].some(k => str.includes(k))) return 'failed';
-  if (['cancelled','canceled','cancelado','expired'].some(k => str.includes(k))) return 'cancelled';
-  return 'unknown';
-}
+  const name = tx.customer?.name || 'Desconhecido';
+  const amount = ((tx.amount || 0) / 100).toFixed(2);
 
-// ─── CRM ───
-async function sendToCRM(tx) {
   try {
-    const payload = {
-      event: 'venda_paga', timestamp: new Date().toISOString(),
-      lead: { nome: tx.customer_name, email: tx.customer_email, telefone: tx.customer_phone, documento: tx.customer_document },
-      transacao: { id: tx.id, produto: tx.product, valor: tx.amount, metodo_pagamento: tx.payment_method, data_pagamento: tx.created_at, status: tx.status },
-      metadata: { source: 'dhr_shield_integration', gateway: 'shield_tecnologia', auto_sent: true, sent_at: new Date().toISOString() },
-    };
-    log('info', `CRM ← ${tx.customer_name} (${tx.id})`);
-    const res = await fetch(CONFIG.crm.url, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload), timeout: 15000,
+    addLog('info', `CRM ← ${name} R$ ${amount}`);
+    const res = await fetch(CONFIG.CRM_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildCRMPayload(tx)),
+      timeout: 15000,
     });
     const text = await res.text().catch(() => '');
+
     if (res.ok) {
-      Q.upCrm.run(text || 'ok', tx.id);
-      log('success', `✓ CRM: ${tx.customer_name} - R$ ${tx.amount}`);
-      broadcast({ type: 'lead_sent', payload: { id: tx.id } });
+      leadsSent[tx.id] = { sentAt: new Date().toISOString(), ok: true };
+      await saveJSON(FILES.leads, leadsSent);
+      addLog('success', `CRM ✓ ${name} - R$ ${amount}`);
+      broadcast({ type: 'lead_sent', payload: { id: tx.id, name, amount } });
       return true;
-    }
-    log('error', `CRM ${res.status}: ${text.substring(0, 200)}`);
-    return false;
-  } catch (e) { log('error', `CRM: ${e.message}`); return false; }
-}
-
-// ─── Processar transação ───
-function processTx(raw) {
-  const tx = normalize(raw);
-  const r = Q.ins.run(tx.id, tx.customer_name, tx.customer_email, tx.customer_phone, tx.customer_document, tx.product, tx.amount, tx.payment_method, tx.status, tx.dhr_status, tx.created_at, JSON.stringify(raw));
-  if (r.changes > 0) {
-    log('success', `Nova transação: ${tx.customer_name} R$ ${tx.amount} [${tx.status}]`);
-    broadcast({ type: 'new_transaction', payload: tx });
-    return tx;
-  }
-  return null;
-}
-
-async function processAndSend(raw) {
-  const tx = processTx(raw);
-  if (tx && tx.status === 'paid' && CONFIG.autoSendCRM) await sendToCRM(tx);
-  return tx;
-}
-
-// ═══════════════════════════════════════
-//  POLLING ENGINE
-// ═══════════════════════════════════════
-let pollTimer = null;
-let isPolling = false;
-
-async function doPoll() {
-  if (isPolling) return;
-  isPolling = true;
-  try {
-    log('info', 'Consultando API Shield/DHR...');
-    const data = await fetchTransactions();
-
-    if (data) {
-      // Extrair array de transações da resposta (vários formatos possíveis)
-      const txs = data.data || data.transactions || data.charges || data.payments ||
-        data.orders || data.sales || data.items || data.results ||
-        data.records || data.content || (Array.isArray(data) ? data : []);
-
-      if (Array.isArray(txs) && txs.length > 0) {
-        let newCount = 0;
-        for (const raw of txs) {
-          const tx = await processAndSend(raw);
-          if (tx) newCount++;
-        }
-        log('info', `Poll concluído: ${newCount} nova(s) de ${txs.length} transações`);
-      } else {
-        log('info', 'API respondeu mas sem transações novas');
-      }
+    } else {
+      leadsSent[tx.id] = { sentAt: new Date().toISOString(), ok: false, error: `${res.status}` };
+      await saveJSON(FILES.leads, leadsSent);
+      addLog('error', `CRM erro ${res.status}: ${text.substring(0, 100)}`);
+      return false;
     }
   } catch (e) {
-    log('error', `Erro no polling: ${e.message}`);
+    addLog('error', `CRM falhou: ${e.message}`);
+    return false;
   }
-  isPolling = false;
-  broadcast({ type: 'poll_complete' });
 }
 
-function startPolling() {
-  if (pollTimer) return;
-  doPoll(); // executa imediatamente
-  pollTimer = setInterval(doPoll, CONFIG.pollInterval);
-  log('info', `🟢 Polling iniciado (intervalo: ${CONFIG.pollInterval / 1000}s)`);
-  broadcast({ type: 'polling_status', payload: { active: true } });
-}
-
-function stopPolling() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-  log('info', '🔴 Polling parado');
-  broadcast({ type: 'polling_status', payload: { active: false } });
+async function autoSendNewLeads() {
+  const pending = txCache.data.filter(t => t.status === 'paid' && !leadsSent[t.id]);
+  if (pending.length === 0) return;
+  addLog('info', `Enviando ${pending.length} leads pendentes ao CRM...`);
+  let sent = 0;
+  for (const tx of pending) {
+    if (await sendLeadToCRM(tx)) sent++;
+    await delay(300);
+  }
+  addLog('success', `${sent}/${pending.length} leads enviados ao CRM`);
 }
 
 // ═══════════════════════════════════════
-//  EXPRESS APP
+//  FILTROS & ANÁLISES
 // ═══════════════════════════════════════
-const app = express();
-app.use(express.json({ limit: '5mb' }));
-app.use(express.urlencoded({ extended: true }));
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', '*');
-  res.header('Access-Control-Allow-Headers', '*');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
 
-// Static files
-for (const sp of [path.join(__dirname, 'public'), path.join(process.cwd(), 'public'), __dirname]) {
-  try { if (fs.existsSync(sp)) app.use(express.static(sp)); } catch(e) {}
+function applyFilters(txs, filters) {
+  let result = [...txs];
+  if (filters.startDate) {
+    const start = new Date(filters.startDate + 'T00:00:00-03:00').getTime();
+    result = result.filter(t => new Date(t.createdAt).getTime() >= start);
+  }
+  if (filters.endDate) {
+    const end = new Date(filters.endDate + 'T23:59:59-03:00').getTime();
+    result = result.filter(t => new Date(t.createdAt).getTime() <= end);
+  }
+  if (filters.status === 'paid') result = result.filter(t => t.status === 'paid');
+  else if (filters.status === 'pending') result = result.filter(t => ['waiting_payment', 'pending'].includes(t.status));
+  if (filters.paymentMethod && filters.paymentMethod !== 'all') result = result.filter(t => t.paymentMethod === filters.paymentMethod);
+  if (filters.search) {
+    const q = filters.search.toLowerCase();
+    result = result.filter(t =>
+      (t.customer?.name || '').toLowerCase().includes(q) ||
+      (t.customer?.email || '').toLowerCase().includes(q) ||
+      (t.customer?.document?.number || '').includes(q) ||
+      (t.customer?.phone || '').includes(q) ||
+      (t.id || '').toLowerCase().includes(q)
+    );
+  }
+  return result;
 }
 
-// ─── WEBHOOK (recebe eventos da DHR/Shield) ───
-app.post('/webhook/dhr', async (req, res) => {
-  try {
-    const ev = req.body;
-    log('info', `Webhook recebido: ${JSON.stringify(ev).substring(0, 300)}`);
-    const evType = (ev.type || ev.event || ev.action || '').toLowerCase();
-    const paidKW = ['paid','approved','completed','confirmed','captured','pago','aprovado','succeeded'];
+function getStats(txs) {
+  const paid = txs.filter(t => t.status === 'paid');
+  const pending = txs.filter(t => ['waiting_payment', 'pending'].includes(t.status));
+  const sentCount = paid.filter(t => leadsSent[t.id]).length;
+  return {
+    total: txs.length,
+    paid: paid.length,
+    pending: pending.length,
+    revenue: paid.reduce((s, t) => s + (t.amount || 0), 0) / 100,
+    netRevenue: paid.reduce((s, t) => s + (t.fee?.netAmount || 0), 0) / 100,
+    avgTicket: paid.length ? paid.reduce((s, t) => s + (t.amount || 0), 0) / paid.length / 100 : 0,
+    conversion: txs.length ? (paid.length / txs.length * 100).toFixed(1) : 0,
+    sentToCRM: sentCount,
+    pendingCRM: paid.length - sentCount,
+    auto_send: CONFIG.AUTO_SEND_CRM,
+    cacheAge: Date.now() - txCache.lastUpdate,
+    isLoading: txCache.isLoading,
+  };
+}
 
-    if (paidKW.some(k => evType.includes(k)) || paidKW.some(k => String(ev.status || ev.data?.status || '').toLowerCase().includes(k))) {
-      await processAndSend(ev.data || ev);
-    } else {
-      const raw = ev.data || ev;
-      if (raw.customer || raw.buyer || raw.amount || raw.value || raw.status) {
-        await processAndSend(raw);
-      } else {
-        log('info', `Evento ignorado: ${evType || 'desconhecido'}`);
-      }
+function getLeads(txs) {
+  const map = {};
+  txs.forEach(t => {
+    const doc = t.customer?.document?.number;
+    if (!doc) return;
+    if (!map[doc]) {
+      map[doc] = {
+        document: doc, name: t.customer?.name || '', email: t.customer?.email || '',
+        phone: t.customer?.phone || '', firstPurchase: t.createdAt, lastPurchase: t.createdAt,
+        totalPurchases: 0, paidPurchases: 0, totalSpent: 0, products: new Set(), crmStatus: 'pending',
+      };
     }
-    res.json({ received: true });
-  } catch (e) { log('error', `Webhook: ${e.message}`); res.json({ received: true }); }
-});
-app.post('/webhook/callback', (req, res) => { req.url = '/webhook/dhr'; app.handle(req, res); });
-app.post('/webhook/shield', (req, res) => { req.url = '/webhook/dhr'; app.handle(req, res); });
+    const lead = map[doc];
+    lead.totalPurchases++;
+    if (t.status === 'paid') {
+      lead.paidPurchases++;
+      lead.totalSpent += (t.amount || 0) / 100;
+      if (leadsSent[t.id]) lead.crmStatus = 'sent';
+    }
+    if (new Date(t.createdAt) < new Date(lead.firstPurchase)) lead.firstPurchase = t.createdAt;
+    if (new Date(t.createdAt) > new Date(lead.lastPurchase)) lead.lastPurchase = t.createdAt;
+    if (t.items?.[0]?.title) lead.products.add(t.items[0].title.split(' - ')[0].trim());
+  });
+  return Object.values(map).map(l => ({ ...l, products: Array.from(l.products).join(', ') }))
+    .sort((a, b) => new Date(b.lastPurchase) - new Date(a.lastPurchase));
+}
 
-// ─── API ENDPOINTS ───
-app.get('/api/stats', (req, res) => {
-  const s = Q.stats.get();
+// ═══════════════════════════════════════
+//  EXPRESS
+// ═══════════════════════════════════════
+
+const app = express();
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/api/stats', (req, res) => res.json(getStats(applyFilters(txCache.data, req.query))));
+
+app.get('/api/transactions', (req, res) => {
+  const txs = applyFilters(txCache.data, req.query);
+  const page = parseInt(req.query.page) || 1;
+  const pageSize = parseInt(req.query.pageSize) || 50;
+  const start = (page - 1) * pageSize;
   res.json({
-    total: s.total || 0, paid: s.paid || 0, sent: s.sent || 0,
-    pending_send: (s.paid || 0) - (s.sent || 0),
-    revenue: s.revenue || 0, polling: !!pollTimer, auto_send: CONFIG.autoSendCRM,
+    data: txs.slice(start, start + pageSize).map(t => ({
+      ...t, crmStatus: leadsSent[t.id] ? 'sent' : (t.status === 'paid' ? 'pending' : 'n/a'),
+      crmSentAt: leadsSent[t.id]?.sentAt || null,
+    })),
+    pagination: { page, pageSize, totalRecords: txs.length, totalPages: Math.ceil(txs.length / pageSize) },
   });
 });
 
-app.get('/api/transactions', (req, res) => {
-  res.json({ data: Q.all.all(Math.min(parseInt(req.query.limit) || 200, 1000)) });
+app.get('/api/leads', (req, res) => res.json(getLeads(applyFilters(txCache.data, req.query))));
+
+app.get('/api/sales', (req, res) => {
+  const txs = applyFilters(txCache.data, req.query);
+  res.json(txs.filter(t => t.status === 'paid').map(t => ({
+    id: t.id, date: t.createdAt, customer: t.customer?.name || 'N/A',
+    email: t.customer?.email || 'N/A', phone: t.customer?.phone || 'N/A',
+    document: t.customer?.document?.number || 'N/A', product: t.items?.[0]?.title || 'N/A',
+    amount: (t.amount || 0) / 100, netAmount: (t.fee?.netAmount || 0) / 100,
+    method: t.paymentMethod || 'N/A', installments: t.installments || 1,
+    crmStatus: leadsSent[t.id] ? 'sent' : 'pending', crmSentAt: leadsSent[t.id]?.sentAt || null,
+  })));
 });
 
-app.get('/api/transactions/pending', (req, res) => {
-  res.json({ data: Q.pending.all() });
+app.get('/api/products', (req, res) => {
+  const products = new Set();
+  txCache.data.forEach(t => { if (t.items?.[0]?.title) products.add(t.items[0].title.split(' - ')[0].trim()); });
+  res.json(Array.from(products).sort());
 });
 
-app.post('/api/transactions/:id/send-crm', async (req, res) => {
-  const tx = Q.get.get(req.params.id);
+app.get('/api/logs', (req, res) => res.json(systemLogs.slice(0, parseInt(req.query.limit) || 100)));
+
+// CRM actions
+app.post('/api/crm/send/:id', async (req, res) => {
+  const tx = txCache.data.find(t => t.id === req.params.id);
   if (!tx) return res.status(404).json({ error: 'Não encontrada' });
-  if (tx.sent_to_crm) return res.json({ success: true, message: 'Já enviado' });
-  res.json({ success: await sendToCRM(tx) });
+  res.json({ success: await sendLeadToCRM(tx) });
 });
 
-app.post('/api/transactions/:id/resend-crm', async (req, res) => {
-  const tx = Q.get.get(req.params.id);
+app.post('/api/crm/resend/:id', async (req, res) => {
+  const tx = txCache.data.find(t => t.id === req.params.id);
   if (!tx) return res.status(404).json({ error: 'Não encontrada' });
-  db.prepare('UPDATE transactions SET sent_to_crm=0, sent_at=NULL WHERE id=?').run(req.params.id);
-  res.json({ success: await sendToCRM(tx) });
+  delete leadsSent[tx.id];
+  res.json({ success: await sendLeadToCRM(tx) });
 });
 
-app.post('/api/transactions/send-all', async (req, res) => {
-  const p = Q.pending.all();
-  if (!p.length) return res.json({ success: true, sent: 0, total: 0 });
-  log('info', `Enviando ${p.length} leads em lote...`);
+app.post('/api/crm/send-all', async (req, res) => {
+  const paid = txCache.data.filter(t => t.status === 'paid' && !leadsSent[t.id]);
+  if (!paid.length) return res.json({ success: true, sent: 0, total: 0 });
+  addLog('info', `Enviando ${paid.length} leads em lote...`);
   let sent = 0;
-  for (const tx of p) { if (await sendToCRM(tx)) sent++; await new Promise(r => setTimeout(r, 500)); }
-  res.json({ success: true, sent, total: p.length });
+  for (const tx of paid) { if (await sendLeadToCRM(tx)) sent++; await delay(300); }
+  res.json({ success: true, sent, total: paid.length });
 });
 
-// ─── POLLING CONTROLS ───
-app.post('/api/polling/start', (req, res) => {
-  startPolling();
-  res.json({ success: true, active: true });
-});
-
-app.post('/api/polling/stop', (req, res) => {
-  stopPolling();
-  res.json({ success: true, active: false });
-});
-
-app.post('/api/polling/trigger', async (req, res) => {
-  await doPoll();
-  res.json({ success: true });
-});
-
-// ─── SETTINGS ───
-app.post('/api/settings/auto-send', (req, res) => {
-  CONFIG.autoSendCRM = req.body.enabled !== false;
-  Q.setS.run('auto_send', String(CONFIG.autoSendCRM));
-  res.json({ success: true, auto_send: CONFIG.autoSendCRM });
-});
-
-app.post('/api/settings/poll-interval', (req, res) => {
-  const s = Math.max(10, Math.min(300, parseInt(req.body.seconds) || 30));
-  CONFIG.pollInterval = s * 1000;
-  Q.setS.run('poll_interval', String(s));
-  if (pollTimer) { stopPolling(); startPolling(); }
-  res.json({ success: true, interval: s });
-});
-
-app.get('/api/logs', (req, res) => {
-  res.json({ data: Q.logs.all(Math.min(parseInt(req.query.limit) || 100, 500)) });
-});
-
-app.post('/api/reset', (req, res) => {
-  db.exec('DELETE FROM transactions; DELETE FROM logs;');
-  workingConfig = null;
-  try { Q.setS.run('working_config', ''); } catch(e) {}
-  log('info', 'Banco limpo');
-  res.json({ success: true });
-});
-
-app.post('/api/test-crm', async (req, res) => {
+app.post('/api/crm/test', async (req, res) => {
   try {
-    const r = await fetch(CONFIG.crm.url, {
+    const r = await fetch(CONFIG.CRM_WEBHOOK_URL, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ event: 'test', lead: { nome: 'Teste' }, transacao: { id: 'test_' + Date.now(), valor: 0 } }),
     });
@@ -513,62 +471,106 @@ app.post('/api/test-crm', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
-app.post('/api/test-dhr', async (req, res) => {
-  try {
-    workingConfig = null; // força redescoberta
-    const data = await fetchTransactions();
-    res.json({ success: !!data, data: data ? 'Conectado' : 'Sem resposta' });
-  } catch (e) { res.json({ success: false, error: e.message }); }
+app.post('/api/settings/auto-send', (req, res) => {
+  CONFIG.AUTO_SEND_CRM = req.body.enabled !== false;
+  res.json({ success: true, auto_send: CONFIG.AUTO_SEND_CRM });
 });
 
-// ─── SPA fallback ───
+app.post('/api/refresh', async (req, res) => {
+  await fetchNewTransactions();
+  res.json({ success: true, transactions: txCache.data.length });
+});
+
+app.post('/api/rebuild-cache', async (req, res) => {
+  txCache.data = [];
+  await fetchAllTransactions();
+  res.json({ success: true, transactions: txCache.data.length });
+});
+
+// Webhook receiver (bonus)
+app.post('/webhook/dhr', async (req, res) => {
+  const ev = req.body;
+  addLog('info', `Webhook: ${JSON.stringify(ev).substring(0, 200)}`);
+  const raw = ev.data || ev;
+  if (raw.id) {
+    const existingIds = new Set(txCache.data.map(t => t.id));
+    if (!existingIds.has(raw.id)) {
+      txCache.data.unshift(raw);
+      txCache.lastUpdate = Date.now();
+      broadcast({ type: 'new_transactions', payload: { count: 1 } });
+      if (raw.status === 'paid' && CONFIG.AUTO_SEND_CRM) await sendLeadToCRM(raw);
+    }
+  }
+  res.json({ received: true });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', transactions: txCache.data.length, leadsSent: Object.keys(leadsSent).length, isLoading: txCache.isLoading });
+});
+
+// SPA fallback
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api/') || req.path.startsWith('/webhook/')) return res.status(404).json({ error: 'Not found' });
-  if (!HTML) HTML = findHtml();
-  if (HTML) return res.type('html').send(HTML);
-  res.type('html').send(`<!DOCTYPE html><html><body style="background:#0a0a12;color:#ccc;font-family:sans-serif;display:grid;place-items:center;min-height:100vh;margin:0">
-    <div style="text-align:center"><h1 style="color:#10b981">⚡ DHR Lead Capture</h1>
-    <p>Servidor rodando. <code>public/index.html</code> não encontrado.</p>
-    <p><a href="/api/stats" style="color:#3b82f6">/api/stats</a></p></div></body></html>`);
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 // ═══════════════════════════════════════
 //  SERVER + WEBSOCKET
 // ═══════════════════════════════════════
+
 const server = http.createServer(app);
-wss = new WebSocketServer({ server, path: '/ws' });
+const wss = new WebSocketServer({ server, path: '/ws' });
 wss.on('connection', ws => {
-  clients.add(ws);
-  ws.send(JSON.stringify({ type: 'init', payload: { polling: !!pollTimer, auto_send: CONFIG.autoSendCRM, stats: Q.stats.get() } }));
-  ws.on('close', () => clients.delete(ws));
+  wsClients.add(ws);
+  ws.send(JSON.stringify({ type: 'init', payload: getStats(txCache.data) }));
+  ws.on('close', () => wsClients.delete(ws));
 });
 
-server.listen(CONFIG.port, () => {
-  console.log(`
-  ╔═══════════════════════════════════════════════════════╗
-  ║   ⚡ DHR Lead Capture System                         ║
-  ╠═══════════════════════════════════════════════════════╣
-  ║   Dashboard:  http://localhost:${CONFIG.port}
-  ║   Webhook:    http://localhost:${CONFIG.port}/webhook/dhr
-  ║   API:        http://localhost:${CONFIG.port}/api/stats
-  ║   WebSocket:  ws://localhost:${CONFIG.port}/ws
-  ╠═══════════════════════════════════════════════════════╣
-  ║   DHR API:    ${CONFIG.dhr.baseUrl}
-  ║   Auto CRM:   ${CONFIG.autoSendCRM}
-  ║   Poll:       ${CONFIG.pollInterval / 1000}s
-  ║   HTML:       ${HTML ? '✓ OK' : '✗ NOT FOUND'}
-  ╚═══════════════════════════════════════════════════════╝
-  `);
+let pollInterval = null;
 
-  log('info', 'Servidor iniciado');
+function startPolling() {
+  if (pollInterval) return;
+  addLog('info', `🟢 Polling iniciado (${CONFIG.POLL_INTERVAL / 1000}s)`);
+  pollInterval = setInterval(fetchNewTransactions, CONFIG.POLL_INTERVAL);
+}
 
-  // Restaura configurações
-  try { const s = Q.getS.get('auto_send'); if (s) CONFIG.autoSendCRM = s.value === 'true'; } catch(e) {}
-  try { const s = Q.getS.get('poll_interval'); if (s) CONFIG.pollInterval = parseInt(s.value) * 1000; } catch(e) {}
+async function init() {
+  // Carregar cache do disco
+  const cached = await loadJSON(FILES.cache, null);
+  if (cached?.data?.length) {
+    txCache.data = cached.data;
+    txCache.lastUpdate = cached.lastUpdate || Date.now();
+    addLog('info', `Cache carregado do disco: ${txCache.data.length} transações`);
+  }
 
-  // ═══ AUTO-START POLLING ═══
-  startPolling();
-});
+  // Carregar leads enviados
+  const saved = await loadJSON(FILES.leads, {});
+  leadsSent = saved || {};
+  addLog('info', `Leads já enviados ao CRM: ${Object.keys(leadsSent).length}`);
 
-process.on('SIGINT', () => { stopPolling(); db.close(); server.close(); process.exit(0); });
-process.on('SIGTERM', () => { stopPolling(); db.close(); server.close(); process.exit(0); });
+  // Iniciar servidor IMEDIATAMENTE
+  server.listen(CONFIG.PORT, () => {
+    console.log(`\n⚡ DHR Lead Capture → CRM DataCrazy`);
+    console.log(`📍 http://localhost:${CONFIG.PORT}`);
+    console.log(`🔗 API Shield: ${CONFIG.DHR_API_URL}`);
+    console.log(`📤 CRM: ${CONFIG.CRM_WEBHOOK_URL ? 'Configurado' : 'Não configurado'}`);
+    console.log(`📦 Cache: ${txCache.data.length} transações\n`);
+  });
+
+  // Buscar dados em background
+  if (txCache.data.length === 0) {
+    addLog('info', 'Sem cache, buscando tudo da API...');
+    fetchAllTransactions()
+      .then(() => startPolling())
+      .catch(() => startPolling());
+  } else {
+    // Já tem cache, busca incrementalmente
+    setTimeout(() => fetchNewTransactions().catch(() => {}), 2000);
+    startPolling();
+  }
+}
+
+init();
+
+process.on('SIGINT', () => { clearInterval(pollInterval); process.exit(0); });
+process.on('SIGTERM', () => { clearInterval(pollInterval); process.exit(0); });
