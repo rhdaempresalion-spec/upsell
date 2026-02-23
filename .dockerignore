@@ -1,0 +1,4 @@
+node_modules
+leads.db
+.env.local
+*.log

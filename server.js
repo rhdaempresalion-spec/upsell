@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
-//  DHR Lead Capture System — Webhook Mode
-//  Recebe eventos da DHR/Shield → Envia para CRM DataCrazy
+//  DHR Lead Capture System - Backend Server
+//  Busca transações na API Shield + Recebe Webhooks → CRM
 // ═══════════════════════════════════════════════════════════════
 
 require('dotenv').config();
@@ -14,16 +14,49 @@ const http = require('http');
 const fs = require('fs');
 
 // ─── Config ───
-const CFG = {
+const CONFIG = {
   port: process.env.PORT || 3000,
   dhr: {
-    baseUrl: process.env.DHR_BASE_URL || 'https://api.shieldtecnologia.com/v1',
+    baseUrl: (process.env.DHR_BASE_URL || 'https://api.shieldtecnologia.com/v1').replace(/\/+$/, ''),
     pk: process.env.DHR_PUBLIC_KEY || '',
     sk: process.env.DHR_SECRET_KEY || '',
   },
   crm: { url: process.env.CRM_WEBHOOK_URL || '' },
-  autoSend: process.env.AUTO_SEND_CRM !== 'false',
+  pollInterval: (parseInt(process.env.POLL_INTERVAL) || 30) * 1000,
+  autoSendCRM: process.env.AUTO_SEND_CRM !== 'false',
 };
+
+// ═══════════════════════════════════════
+//  Assinatura HMAC-SHA512 (Shield/Solidgate pattern)
+// ═══════════════════════════════════════
+function makeSignature(body = '') {
+  const data = body ? (CONFIG.dhr.pk + body + CONFIG.dhr.pk) : (CONFIG.dhr.pk + CONFIG.dhr.pk);
+  const hex = crypto.createHmac('sha512', CONFIG.dhr.sk).update(data).digest('hex');
+  return Buffer.from(hex).toString('base64');
+}
+
+// Gera headers em vários formatos de auth pra tentar
+function authSets(bodyStr = '') {
+  const sig = makeSignature(bodyStr);
+  return [
+    // 1) Bearer com secret key (mais comum)
+    { name: 'Bearer-SK', headers: { 'Authorization': `Bearer ${CONFIG.dhr.sk}` } },
+    // 2) HMAC signature (Solidgate/Shield style)
+    { name: 'HMAC-Sig', headers: { 'public-key': CONFIG.dhr.pk, 'signature': sig } },
+    // 3) Basic auth pk:sk
+    { name: 'Basic', headers: { 'Authorization': 'Basic ' + Buffer.from(CONFIG.dhr.pk + ':' + CONFIG.dhr.sk).toString('base64') } },
+    // 4) X-Api-Key
+    { name: 'X-Api-Key', headers: { 'X-Api-Key': CONFIG.dhr.sk } },
+    // 5) Bearer com public key
+    { name: 'Bearer-PK', headers: { 'Authorization': `Bearer ${CONFIG.dhr.pk}` } },
+    // 6) Public + Secret headers
+    { name: 'PK+SK', headers: { 'public-key': CONFIG.dhr.pk, 'secret-key': CONFIG.dhr.sk } },
+    // 7) Token header
+    { name: 'Token', headers: { 'Token': CONFIG.dhr.sk } },
+    // 8) Merchant style
+    { name: 'Merchant', headers: { 'merchant-id': CONFIG.dhr.pk, 'Authorization': `Bearer ${CONFIG.dhr.sk}` } },
+  ];
+}
 
 // ─── Find HTML ───
 function findHtml() {
@@ -38,7 +71,7 @@ function findHtml() {
 let HTML = findHtml();
 
 // ─── Database ───
-const db = new Database(process.env.DB_PATH || path.join(__dirname, 'leads.db'));
+const db = new Database(path.join(__dirname, 'leads.db'));
 db.pragma('journal_mode = WAL');
 db.exec(`
   CREATE TABLE IF NOT EXISTS transactions (
@@ -49,8 +82,8 @@ db.exec(`
     sent_to_crm INTEGER DEFAULT 0, sent_at TEXT, crm_response TEXT, raw_data TEXT
   );
   CREATE TABLE IF NOT EXISTS logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, message TEXT,
-    data TEXT, created_at TEXT DEFAULT (datetime('now'))
+    id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, message TEXT, data TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
   );
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
   CREATE INDEX IF NOT EXISTS idx_st ON transactions(status);
@@ -59,9 +92,9 @@ db.exec(`
 
 const Q = {
   ins: db.prepare(`INSERT OR IGNORE INTO transactions (id,customer_name,customer_email,customer_phone,customer_document,product,amount,payment_method,status,dhr_status,created_at,raw_data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`),
-  upCrm: db.prepare(`UPDATE transactions SET sent_to_crm=1,sent_at=datetime('now'),crm_response=? WHERE id=?`),
+  upCrm: db.prepare(`UPDATE transactions SET sent_to_crm=1, sent_at=datetime('now'), crm_response=? WHERE id=?`),
   get: db.prepare('SELECT * FROM transactions WHERE id=?'),
-  all: db.prepare('SELECT * FROM transactions ORDER BY received_at DESC LIMIT ?'),
+  all: db.prepare('SELECT * FROM transactions ORDER BY created_at DESC LIMIT ?'),
   pending: db.prepare("SELECT * FROM transactions WHERE status='paid' AND sent_to_crm=0"),
   stats: db.prepare(`SELECT COUNT(*) as total, SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END) as paid, SUM(CASE WHEN sent_to_crm=1 THEN 1 ELSE 0 END) as sent, SUM(CASE WHEN status='paid' THEN amount ELSE 0 END) as revenue FROM transactions`),
   log: db.prepare('INSERT INTO logs (type,message,data) VALUES (?,?,?)'),
@@ -81,90 +114,191 @@ function log(type, msg, data = null) {
 }
 
 // ═══════════════════════════════════════
-//  Normalizar transação (qualquer formato)
+//  SHIELD API - Buscar Transações (POLLING)
 // ═══════════════════════════════════════
-function normalize(raw) {
-  // Desembala: event pode ter data, transaction, charge, etc
-  const tx = raw.data?.transaction || raw.data?.charge || raw.data?.payment ||
-             raw.data?.order || raw.data || raw.transaction || raw.charge ||
-             raw.payment || raw.order || raw;
 
-  // Nome: busca em vários caminhos
-  const name = tx.customer?.name || tx.buyer?.name || tx.payer?.name ||
-               tx.client?.name || tx.subscriber?.name ||
-               tx.name || tx.customer_name || tx.buyer_name || '';
+// Endpoints pra tentar (do mais comum ao menos)
+const API_ENDPOINTS = [
+  '/transactions', '/transaction',
+  '/charges', '/charge',
+  '/payments', '/payment',
+  '/orders', '/order',
+  '/sales', '/sale',
+  '/invoices', '/invoice',
+  '/subscriptions',
+];
 
-  const email = tx.customer?.email || tx.buyer?.email || tx.payer?.email ||
-                tx.client?.email || tx.subscriber?.email ||
-                tx.email || tx.customer_email || tx.buyer_email || '';
+// Query params pra tentar
+const QUERY_PATTERNS = [
+  '?page=1&status=paid',
+  '?page=1&filter[status]=paid',
+  '?page=1',
+  '?status=paid&limit=50',
+  '?limit=50',
+  '',
+];
 
-  const phone = tx.customer?.phone || tx.customer?.phone_number || tx.customer?.cellphone ||
-                tx.customer?.mobile || tx.buyer?.phone || tx.payer?.phone ||
-                tx.client?.phone || tx.subscriber?.phone ||
-                tx.phone || tx.cellphone || tx.phone_number || tx.mobile || '';
+async function tryRequest(url, headers, method = 'GET', body = null) {
+  try {
+    const opts = {
+      method,
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', ...headers },
+      timeout: 10000,
+    };
+    if (body) opts.body = typeof body === 'string' ? body : JSON.stringify(body);
+    const res = await fetch(url, opts);
+    const text = await res.text();
 
-  const doc = tx.customer?.document || tx.customer?.cpf || tx.customer?.document_number ||
-              tx.customer?.tax_id || tx.buyer?.cpf || tx.buyer?.document ||
-              tx.client?.document || tx.subscriber?.document ||
-              tx.cpf || tx.document || tx.document_number || tx.tax_id || '';
+    // Se retorna HTML é 404 page, ignora
+    if (text.includes('<!DOCTYPE') || text.includes('<html')) {
+      return { ok: false, status: res.status, html: true };
+    }
 
-  const product = tx.product?.name || tx.plan?.name || tx.offer?.name ||
-                  tx.items?.[0]?.name || tx.items?.[0]?.title ||
-                  tx.description || tx.product_name || tx.plan_name ||
-                  tx.subscription?.plan?.name || '';
+    let data;
+    try { data = JSON.parse(text); } catch(e) { data = text; }
 
-  let amount = tx.amount || tx.value || tx.total || tx.price ||
-               tx.payment?.amount || tx.subscription?.price || 0;
-  if (typeof amount === 'string') amount = parseFloat(amount.replace(/[^\d.,]/g, '').replace(',', '.'));
-  if (isNaN(amount)) amount = 0;
-  if (amount > 10000) amount = amount / 100; // centavos → reais
-
-  const method = tx.payment_method || tx.method || tx.type ||
-                 tx.payment?.method || tx.payment?.type ||
-                 tx.payment_type || 'desconhecido';
-
-  const rawStatus = String(tx.status || tx.payment_status || tx.payment?.status ||
-                           tx.subscription?.status || raw.event || raw.type || '').toLowerCase();
-
-  let status = 'unknown';
-  if (['paid','approved','confirmed','completed','captured','autorizado','pago','aprovado','active','succeeded','accepted'].some(k => rawStatus.includes(k))) status = 'paid';
-  else if (['refund','reversed','estornado','reembolsado','chargeback'].some(k => rawStatus.includes(k))) status = 'refunded';
-  else if (['pending','waiting','pendente','aguardando','processing','created','generated'].some(k => rawStatus.includes(k))) status = 'pending';
-  else if (['failed','denied','declined','negado','recusado','refused','rejected'].some(k => rawStatus.includes(k))) status = 'failed';
-  else if (['cancelled','canceled','cancelado','expired','expirado','voided'].some(k => rawStatus.includes(k))) status = 'cancelled';
-
-  const id = tx.id || tx.transaction_id || tx.charge_id || tx.payment_id ||
-             tx.order_id || tx.code || tx.reference ||
-             `wh_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-
-  const created = tx.created_at || tx.paid_at || tx.date || tx.createdAt ||
-                  tx.updated_at || tx.confirmed_at || new Date().toISOString();
-
-  return { id: String(id), customer_name: name, customer_email: email, customer_phone: phone,
-           customer_document: doc, product, amount, payment_method: method,
-           status, dhr_status: rawStatus, created_at: created };
+    return { ok: res.ok, status: res.status, data, text: text.substring(0, 300) };
+  } catch (e) {
+    return { ok: false, status: 'ERR', error: e.message };
+  }
 }
 
-// ═══════════════════════════════════════
-//  CRM
-// ═══════════════════════════════════════
+// Endpoint que já sabemos que funciona (salvo em settings)
+let workingConfig = null; // { endpoint, query, auth, method }
+
+async function fetchTransactions() {
+  const base = CONFIG.dhr.baseUrl;
+
+  // 1) Se já temos endpoint que funciona, usa direto
+  if (workingConfig) {
+    const url = `${base}${workingConfig.endpoint}${workingConfig.query}`;
+    const auths = authSets();
+    const auth = auths.find(a => a.name === workingConfig.auth) || auths[0];
+    const body = workingConfig.method === 'POST' ? JSON.stringify({ page: 1, status: 'paid', per_page: 50 }) : null;
+    const r = await tryRequest(url, auth.headers, workingConfig.method, body);
+
+    if (r.ok) {
+      log('success', `Endpoint ${workingConfig.method} ${workingConfig.endpoint} [${workingConfig.auth}] → ${r.status}`);
+      return r.data;
+    }
+    // Se parou de funcionar, reseta
+    log('info', `Endpoint salvo parou de funcionar (${r.status}), redescobring...`);
+    workingConfig = null;
+  }
+
+  // 2) Tenta restaurar de settings
+  try {
+    const saved = Q.getS.get('working_config');
+    if (saved && !workingConfig) {
+      workingConfig = JSON.parse(saved.value);
+      return await fetchTransactions(); // recursão 1x
+    }
+  } catch(e) {}
+
+  // 3) Descobre endpoint — testa tudo
+  log('info', 'Descobrindo endpoints da API Shield...');
+
+  for (const authSet of authSets()) {
+    for (const ep of API_ENDPOINTS) {
+      // GET com vários query patterns
+      for (const qp of QUERY_PATTERNS) {
+        const url = `${base}${ep}${qp}`;
+        const r = await tryRequest(url, authSet.headers, 'GET');
+
+        if (r.ok) {
+          log('success', `✓ ENCONTRADO: GET ${ep}${qp} [${authSet.name}] → ${r.status}`);
+          workingConfig = { endpoint: ep, query: qp, auth: authSet.name, method: 'GET' };
+          Q.setS.run('working_config', JSON.stringify(workingConfig));
+          return r.data;
+        }
+
+        if (r.status === 401 || r.status === 403) {
+          log('info', `${ep} [${authSet.name}] → ${r.status} (auth rejeitada)`);
+          break; // pula pra próxima auth nesse endpoint
+        }
+
+        if (!r.html && r.status !== 404 && r.status !== 'ERR') {
+          log('info', `${ep}${qp} [${authSet.name}] → ${r.status}: ${r.text || r.error || ''}`);
+        }
+      }
+
+      // POST (alguns gateways usam POST pra listar)
+      const postBody = JSON.stringify({ page: 1, status: 'paid', per_page: 50, limit: 50 });
+      const rp = await tryRequest(`${base}${ep}`, authSet.headers, 'POST', postBody);
+      if (rp.ok) {
+        log('success', `✓ ENCONTRADO: POST ${ep} [${authSet.name}] → ${rp.status}`);
+        workingConfig = { endpoint: ep, query: '', auth: authSet.name, method: 'POST' };
+        Q.setS.run('working_config', JSON.stringify(workingConfig));
+        return rp.data;
+      }
+
+      // POST /list pattern
+      const rl = await tryRequest(`${base}${ep}/list`, authSet.headers, 'POST', postBody);
+      if (rl.ok) {
+        log('success', `✓ ENCONTRADO: POST ${ep}/list [${authSet.name}] → ${rl.status}`);
+        workingConfig = { endpoint: `${ep}/list`, query: '', auth: authSet.name, method: 'POST' };
+        Q.setS.run('working_config', JSON.stringify(workingConfig));
+        return rl.data;
+      }
+    }
+  }
+
+  log('error', 'Nenhum endpoint da API Shield respondeu. Verifique a documentação ou use webhooks.');
+  return null;
+}
+
+// ─── Normalizar transação ───
+function normalize(raw) {
+  const tx = raw.data || raw.transaction || raw.charge || raw.payment || raw;
+  return {
+    id: tx.id || tx.transaction_id || tx.charge_id || tx.code || `dhr_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,
+    customer_name: tx.customer?.name || tx.buyer?.name || tx.payer?.name || tx.name || '',
+    customer_email: tx.customer?.email || tx.buyer?.email || tx.payer?.email || tx.email || '',
+    customer_phone: tx.customer?.phone || tx.customer?.phone_number || tx.customer?.cellphone || tx.buyer?.phone || tx.phone || tx.cellphone || '',
+    customer_document: tx.customer?.document || tx.customer?.cpf || tx.customer?.document_number || tx.buyer?.cpf || tx.cpf || tx.document || '',
+    product: tx.product?.name || tx.items?.[0]?.name || tx.description || tx.product_name || tx.offer?.name || tx.plan?.name || '',
+    amount: parseAmount(tx.amount || tx.value || tx.total || tx.price || 0),
+    payment_method: tx.payment_method || tx.method || tx.type || tx.payment?.method || 'unknown',
+    status: normStatus(tx.status || tx.payment_status || tx.payment?.status || ''),
+    dhr_status: tx.status || '',
+    created_at: tx.created_at || tx.paid_at || tx.date || tx.createdAt || tx.updated_at || new Date().toISOString(),
+  };
+}
+
+function parseAmount(v) {
+  if (typeof v === 'string') v = parseFloat(v.replace(/[^\d.,]/g, '').replace(',', '.'));
+  if (isNaN(v)) return 0;
+  return v > 10000 ? v / 100 : v;
+}
+
+function normStatus(s) {
+  const str = String(s).toLowerCase();
+  if (['paid','approved','confirmed','completed','captured','autorizado','pago','aprovado','active','succeeded'].some(k => str.includes(k))) return 'paid';
+  if (['refund','reversed','estornado','reembolsado'].some(k => str.includes(k))) return 'refunded';
+  if (['pending','waiting','pendente','aguardando','processing','created'].some(k => str.includes(k))) return 'pending';
+  if (['failed','denied','declined','negado','recusado','refused'].some(k => str.includes(k))) return 'failed';
+  if (['cancelled','canceled','cancelado','expired'].some(k => str.includes(k))) return 'cancelled';
+  return 'unknown';
+}
+
+// ─── CRM ───
 async function sendToCRM(tx) {
   try {
     const payload = {
       event: 'venda_paga', timestamp: new Date().toISOString(),
       lead: { nome: tx.customer_name, email: tx.customer_email, telefone: tx.customer_phone, documento: tx.customer_document },
       transacao: { id: tx.id, produto: tx.product, valor: tx.amount, metodo_pagamento: tx.payment_method, data_pagamento: tx.created_at, status: tx.status },
-      metadata: { source: 'dhr_shield_integration', gateway: 'shield_tecnologia', sent_at: new Date().toISOString() },
+      metadata: { source: 'dhr_shield_integration', gateway: 'shield_tecnologia', auto_sent: true, sent_at: new Date().toISOString() },
     };
-    log('info', `CRM ← ${tx.customer_name || tx.id}`);
-    const res = await fetch(CFG.crm.url, {
+    log('info', `CRM ← ${tx.customer_name} (${tx.id})`);
+    const res = await fetch(CONFIG.crm.url, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload), timeout: 15000,
     });
     const text = await res.text().catch(() => '');
     if (res.ok) {
       Q.upCrm.run(text || 'ok', tx.id);
-      log('success', `✓ CRM: ${tx.customer_name} R$ ${tx.amount}`);
+      log('success', `✓ CRM: ${tx.customer_name} - R$ ${tx.amount}`);
       broadcast({ type: 'lead_sent', payload: { id: tx.id } });
       return true;
     }
@@ -173,30 +307,81 @@ async function sendToCRM(tx) {
   } catch (e) { log('error', `CRM: ${e.message}`); return false; }
 }
 
-// ─── Process incoming transaction ───
-async function processIncoming(raw) {
+// ─── Processar transação ───
+function processTx(raw) {
   const tx = normalize(raw);
-  const r = Q.ins.run(tx.id, tx.customer_name, tx.customer_email, tx.customer_phone,
-    tx.customer_document, tx.product, tx.amount, tx.payment_method,
-    tx.status, tx.dhr_status, tx.created_at, JSON.stringify(raw));
-
+  const r = Q.ins.run(tx.id, tx.customer_name, tx.customer_email, tx.customer_phone, tx.customer_document, tx.product, tx.amount, tx.payment_method, tx.status, tx.dhr_status, tx.created_at, JSON.stringify(raw));
   if (r.changes > 0) {
-    log('success', `Nova transação: ${tx.customer_name || '(sem nome)'} R$ ${tx.amount} [${tx.status}]`);
+    log('success', `Nova transação: ${tx.customer_name} R$ ${tx.amount} [${tx.status}]`);
     broadcast({ type: 'new_transaction', payload: tx });
-    if (tx.status === 'paid' && CFG.autoSend) {
-      await sendToCRM(tx);
-    }
     return tx;
   }
-  return null; // duplicada
+  return null;
+}
+
+async function processAndSend(raw) {
+  const tx = processTx(raw);
+  if (tx && tx.status === 'paid' && CONFIG.autoSendCRM) await sendToCRM(tx);
+  return tx;
 }
 
 // ═══════════════════════════════════════
-//  Express
+//  POLLING ENGINE
+// ═══════════════════════════════════════
+let pollTimer = null;
+let isPolling = false;
+
+async function doPoll() {
+  if (isPolling) return;
+  isPolling = true;
+  try {
+    log('info', 'Consultando API Shield/DHR...');
+    const data = await fetchTransactions();
+
+    if (data) {
+      // Extrair array de transações da resposta (vários formatos possíveis)
+      const txs = data.data || data.transactions || data.charges || data.payments ||
+        data.orders || data.sales || data.items || data.results ||
+        data.records || data.content || (Array.isArray(data) ? data : []);
+
+      if (Array.isArray(txs) && txs.length > 0) {
+        let newCount = 0;
+        for (const raw of txs) {
+          const tx = await processAndSend(raw);
+          if (tx) newCount++;
+        }
+        log('info', `Poll concluído: ${newCount} nova(s) de ${txs.length} transações`);
+      } else {
+        log('info', 'API respondeu mas sem transações novas');
+      }
+    }
+  } catch (e) {
+    log('error', `Erro no polling: ${e.message}`);
+  }
+  isPolling = false;
+  broadcast({ type: 'poll_complete' });
+}
+
+function startPolling() {
+  if (pollTimer) return;
+  doPoll(); // executa imediatamente
+  pollTimer = setInterval(doPoll, CONFIG.pollInterval);
+  log('info', `🟢 Polling iniciado (intervalo: ${CONFIG.pollInterval / 1000}s)`);
+  broadcast({ type: 'polling_status', payload: { active: true } });
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  log('info', '🔴 Polling parado');
+  broadcast({ type: 'polling_status', payload: { active: false } });
+}
+
+// ═══════════════════════════════════════
+//  EXPRESS APP
 // ═══════════════════════════════════════
 const app = express();
 app.use(express.json({ limit: '5mb' }));
-app.use(express.urlencoded({ extended: true, limit: '5mb' }));
+app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', '*');
@@ -206,68 +391,41 @@ app.use((req, res, next) => {
 });
 
 // Static files
-for (const sp of [path.join(__dirname,'public'), path.join(process.cwd(),'public'), __dirname]) {
+for (const sp of [path.join(__dirname, 'public'), path.join(process.cwd(), 'public'), __dirname]) {
   try { if (fs.existsSync(sp)) app.use(express.static(sp)); } catch(e) {}
 }
 
-// ═══════════════════════════════════════
-//  WEBHOOK — Aceita QUALQUER formato
-//  Configure no painel DHR: POST /webhook/dhr
-// ═══════════════════════════════════════
-function webhookHandler(req, res) {
+// ─── WEBHOOK (recebe eventos da DHR/Shield) ───
+app.post('/webhook/dhr', async (req, res) => {
   try {
-    const body = req.body;
+    const ev = req.body;
+    log('info', `Webhook recebido: ${JSON.stringify(ev).substring(0, 300)}`);
+    const evType = (ev.type || ev.event || ev.action || '').toLowerCase();
+    const paidKW = ['paid','approved','completed','confirmed','captured','pago','aprovado','succeeded'];
 
-    if (!body || (typeof body === 'object' && Object.keys(body).length === 0)) {
-      log('info', 'Webhook vazio recebido');
-      return res.json({ received: true });
+    if (paidKW.some(k => evType.includes(k)) || paidKW.some(k => String(ev.status || ev.data?.status || '').toLowerCase().includes(k))) {
+      await processAndSend(ev.data || ev);
+    } else {
+      const raw = ev.data || ev;
+      if (raw.customer || raw.buyer || raw.amount || raw.value || raw.status) {
+        await processAndSend(raw);
+      } else {
+        log('info', `Evento ignorado: ${evType || 'desconhecido'}`);
+      }
     }
+    res.json({ received: true });
+  } catch (e) { log('error', `Webhook: ${e.message}`); res.json({ received: true }); }
+});
+app.post('/webhook/callback', (req, res) => { req.url = '/webhook/dhr'; app.handle(req, res); });
+app.post('/webhook/shield', (req, res) => { req.url = '/webhook/dhr'; app.handle(req, res); });
 
-    log('info', `⚡ Webhook recebido [${req.path}]: ${JSON.stringify(body).substring(0, 400)}`);
-
-    // Se for array de transações
-    if (Array.isArray(body)) {
-      body.forEach(item => processIncoming(item));
-    }
-    // Se tiver lista dentro
-    else if (Array.isArray(body.data)) {
-      body.data.forEach(item => processIncoming(item));
-    }
-    else if (Array.isArray(body.transactions)) {
-      body.transactions.forEach(item => processIncoming(item));
-    }
-    // Evento único
-    else {
-      processIncoming(body);
-    }
-
-    res.json({ received: true, status: 'ok' });
-  } catch (e) {
-    log('error', `Webhook erro: ${e.message}`);
-    res.json({ received: true, error: e.message });
-  }
-}
-
-// Aceita em TODAS as rotas possíveis de webhook
-app.post('/webhook/dhr', webhookHandler);
-app.post('/webhook/shield', webhookHandler);
-app.post('/webhook/callback', webhookHandler);
-app.post('/webhook', webhookHandler);
-app.post('/callback', webhookHandler);
-app.post('/notification', webhookHandler);
-app.post('/notify', webhookHandler);
-app.post('/postback', webhookHandler);
-app.post('/ipn', webhookHandler);
-
-// ═══════════════════════════════════════
-//  API (Dashboard → Server)
-// ═══════════════════════════════════════
+// ─── API ENDPOINTS ───
 app.get('/api/stats', (req, res) => {
   const s = Q.stats.get();
   res.json({
     total: s.total || 0, paid: s.paid || 0, sent: s.sent || 0,
     pending_send: (s.paid || 0) - (s.sent || 0),
-    revenue: s.revenue || 0, polling: false, auto_send: CFG.autoSend,
+    revenue: s.revenue || 0, polling: !!pollTimer, auto_send: CONFIG.autoSendCRM,
   });
 });
 
@@ -281,65 +439,56 @@ app.get('/api/transactions/pending', (req, res) => {
 
 app.post('/api/transactions/:id/send-crm', async (req, res) => {
   const tx = Q.get.get(req.params.id);
-  if (!tx) return res.status(404).json({ error: '404' });
+  if (!tx) return res.status(404).json({ error: 'Não encontrada' });
   if (tx.sent_to_crm) return res.json({ success: true, message: 'Já enviado' });
   res.json({ success: await sendToCRM(tx) });
 });
 
 app.post('/api/transactions/:id/resend-crm', async (req, res) => {
   const tx = Q.get.get(req.params.id);
-  if (!tx) return res.status(404).json({ error: '404' });
-  db.prepare('UPDATE transactions SET sent_to_crm=0,sent_at=NULL WHERE id=?').run(req.params.id);
+  if (!tx) return res.status(404).json({ error: 'Não encontrada' });
+  db.prepare('UPDATE transactions SET sent_to_crm=0, sent_at=NULL WHERE id=?').run(req.params.id);
   res.json({ success: await sendToCRM(tx) });
 });
 
 app.post('/api/transactions/send-all', async (req, res) => {
   const p = Q.pending.all();
   if (!p.length) return res.json({ success: true, sent: 0, total: 0 });
+  log('info', `Enviando ${p.length} leads em lote...`);
   let sent = 0;
-  for (const tx of p) {
-    if (await sendToCRM(tx)) sent++;
-    await new Promise(r => setTimeout(r, 300));
-  }
+  for (const tx of p) { if (await sendToCRM(tx)) sent++; await new Promise(r => setTimeout(r, 500)); }
   res.json({ success: true, sent, total: p.length });
 });
 
-// ─── Adicionar lead manualmente ───
-app.post('/api/transactions/add', async (req, res) => {
-  try {
-    const b = req.body;
-    const tx = {
-      id: `manual_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`,
-      customer_name: b.name || '',
-      customer_email: b.email || '',
-      customer_phone: b.phone || '',
-      customer_document: b.document || '',
-      product: b.product || '',
-      amount: parseFloat(b.amount) || 0,
-      payment_method: b.method || 'manual',
-      status: 'paid',
-      dhr_status: 'manual',
-      created_at: new Date().toISOString(),
-    };
-    Q.ins.run(tx.id, tx.customer_name, tx.customer_email, tx.customer_phone,
-      tx.customer_document, tx.product, tx.amount, tx.payment_method,
-      tx.status, tx.dhr_status, tx.created_at, JSON.stringify(b));
-    log('success', `Lead manual: ${tx.customer_name} R$ ${tx.amount}`);
-    broadcast({ type: 'new_transaction', payload: tx });
-    if (CFG.autoSend) await sendToCRM(tx);
-    res.json({ success: true, id: tx.id });
-  } catch (e) { res.json({ success: false, error: e.message }); }
+// ─── POLLING CONTROLS ───
+app.post('/api/polling/start', (req, res) => {
+  startPolling();
+  res.json({ success: true, active: true });
 });
 
-// ─── Polling stubs (para compatibilidade com dashboard) ───
-app.post('/api/polling/start', (req, res) => { log('info', 'Polling não disponível — use Webhook'); res.json({ success: false, message: 'API Shield não suporta listagem. Use webhook.' }); });
-app.post('/api/polling/stop', (req, res) => { res.json({ success: true }); });
-app.post('/api/polling/trigger', (req, res) => { log('info', 'Polling não disponível — use Webhook'); res.json({ success: false, message: 'Use webhook' }); });
+app.post('/api/polling/stop', (req, res) => {
+  stopPolling();
+  res.json({ success: true, active: false });
+});
 
+app.post('/api/polling/trigger', async (req, res) => {
+  await doPoll();
+  res.json({ success: true });
+});
+
+// ─── SETTINGS ───
 app.post('/api/settings/auto-send', (req, res) => {
-  CFG.autoSend = req.body.enabled !== false;
-  Q.setS.run('auto_send', String(CFG.autoSend));
-  res.json({ success: true, auto_send: CFG.autoSend });
+  CONFIG.autoSendCRM = req.body.enabled !== false;
+  Q.setS.run('auto_send', String(CONFIG.autoSendCRM));
+  res.json({ success: true, auto_send: CONFIG.autoSendCRM });
+});
+
+app.post('/api/settings/poll-interval', (req, res) => {
+  const s = Math.max(10, Math.min(300, parseInt(req.body.seconds) || 30));
+  CONFIG.pollInterval = s * 1000;
+  Q.setS.run('poll_interval', String(s));
+  if (pollTimer) { stopPolling(); startPolling(); }
+  res.json({ success: true, interval: s });
 });
 
 app.get('/api/logs', (req, res) => {
@@ -348,13 +497,15 @@ app.get('/api/logs', (req, res) => {
 
 app.post('/api/reset', (req, res) => {
   db.exec('DELETE FROM transactions; DELETE FROM logs;');
-  log('info', 'DB limpo');
+  workingConfig = null;
+  try { Q.setS.run('working_config', ''); } catch(e) {}
+  log('info', 'Banco limpo');
   res.json({ success: true });
 });
 
 app.post('/api/test-crm', async (req, res) => {
   try {
-    const r = await fetch(CFG.crm.url, {
+    const r = await fetch(CONFIG.crm.url, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ event: 'test', lead: { nome: 'Teste' }, transacao: { id: 'test_' + Date.now(), valor: 0 } }),
     });
@@ -362,27 +513,17 @@ app.post('/api/test-crm', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
-// ─── Webhook test (simula uma venda) ───
-app.post('/api/test-webhook', async (req, res) => {
-  const fake = {
-    type: 'transaction.paid',
-    data: {
-      id: 'test_' + Date.now(),
-      status: 'paid',
-      amount: 97.00,
-      payment_method: 'pix',
-      customer: { name: 'Lead Teste', email: 'teste@exemplo.com', phone: '5511999999999', document: '12345678900' },
-      product: { name: 'Produto Teste' },
-      created_at: new Date().toISOString(),
-    },
-  };
-  const tx = await processIncoming(fake);
-  res.json({ success: !!tx, transaction: tx });
+app.post('/api/test-dhr', async (req, res) => {
+  try {
+    workingConfig = null; // força redescoberta
+    const data = await fetchTransactions();
+    res.json({ success: !!data, data: data ? 'Conectado' : 'Sem resposta' });
+  } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
-// ─── SPA Fallback ───
+// ─── SPA fallback ───
 app.get('*', (req, res) => {
-  if (req.path.startsWith('/api/') || req.path.startsWith('/webhook')) return res.status(404).json({ error: 'Not found' });
+  if (req.path.startsWith('/api/') || req.path.startsWith('/webhook/')) return res.status(404).json({ error: 'Not found' });
   if (!HTML) HTML = findHtml();
   if (HTML) return res.type('html').send(HTML);
   res.type('html').send(`<!DOCTYPE html><html><body style="background:#0a0a12;color:#ccc;font-family:sans-serif;display:grid;place-items:center;min-height:100vh;margin:0">
@@ -392,38 +533,42 @@ app.get('*', (req, res) => {
 });
 
 // ═══════════════════════════════════════
-//  Server + WebSocket
+//  SERVER + WEBSOCKET
 // ═══════════════════════════════════════
 const server = http.createServer(app);
 wss = new WebSocketServer({ server, path: '/ws' });
 wss.on('connection', ws => {
   clients.add(ws);
-  ws.send(JSON.stringify({ type: 'init', payload: { polling: false, auto_send: CFG.autoSend, stats: Q.stats.get() } }));
+  ws.send(JSON.stringify({ type: 'init', payload: { polling: !!pollTimer, auto_send: CONFIG.autoSendCRM, stats: Q.stats.get() } }));
   ws.on('close', () => clients.delete(ws));
 });
 
-server.listen(CFG.port, () => {
-  const webhookUrl = `http://localhost:${CFG.port}/webhook/dhr`;
+server.listen(CONFIG.port, () => {
   console.log(`
-  ╔═══════════════════════════════════════════════════════════╗
-  ║   ⚡ DHR Lead Capture — Modo Webhook                     ║
-  ╠═══════════════════════════════════════════════════════════╣
-  ║   Dashboard:    http://localhost:${CFG.port}
-  ║   Webhook URL:  POST /webhook/dhr
-  ║   Test Webhook: POST /api/test-webhook
-  ║   HTML:         ${HTML ? '✓ OK' : '✗ NOT FOUND'}
-  ╠═══════════════════════════════════════════════════════════╣
-  ║                                                           ║
-  ║   Configure no painel DHR/Shield:                         ║
-  ║   URL: https://SEU-DOMINIO/webhook/dhr                    ║
-  ║   Método: POST                                            ║
-  ║   Eventos: transaction.paid, payment.approved             ║
-  ║                                                           ║
-  ╚═══════════════════════════════════════════════════════════╝
+  ╔═══════════════════════════════════════════════════════╗
+  ║   ⚡ DHR Lead Capture System                         ║
+  ╠═══════════════════════════════════════════════════════╣
+  ║   Dashboard:  http://localhost:${CONFIG.port}
+  ║   Webhook:    http://localhost:${CONFIG.port}/webhook/dhr
+  ║   API:        http://localhost:${CONFIG.port}/api/stats
+  ║   WebSocket:  ws://localhost:${CONFIG.port}/ws
+  ╠═══════════════════════════════════════════════════════╣
+  ║   DHR API:    ${CONFIG.dhr.baseUrl}
+  ║   Auto CRM:   ${CONFIG.autoSendCRM}
+  ║   Poll:       ${CONFIG.pollInterval / 1000}s
+  ║   HTML:       ${HTML ? '✓ OK' : '✗ NOT FOUND'}
+  ╚═══════════════════════════════════════════════════════╝
   `);
-  log('info', 'Servidor iniciado (modo webhook)');
-  try { const s = Q.getS.get('auto_send'); if (s) CFG.autoSend = s.value === 'true'; } catch(e) {}
+
+  log('info', 'Servidor iniciado');
+
+  // Restaura configurações
+  try { const s = Q.getS.get('auto_send'); if (s) CONFIG.autoSendCRM = s.value === 'true'; } catch(e) {}
+  try { const s = Q.getS.get('poll_interval'); if (s) CONFIG.pollInterval = parseInt(s.value) * 1000; } catch(e) {}
+
+  // ═══ AUTO-START POLLING ═══
+  startPolling();
 });
 
-process.on('SIGINT', () => { db.close(); server.close(); process.exit(0); });
-process.on('SIGTERM', () => { db.close(); server.close(); process.exit(0); });
+process.on('SIGINT', () => { stopPolling(); db.close(); server.close(); process.exit(0); });
+process.on('SIGTERM', () => { stopPolling(); db.close(); server.close(); process.exit(0); });
