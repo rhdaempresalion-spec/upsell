@@ -65,6 +65,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
     <span class="chip" onclick="setFilter(this,'invalid')">✗ Inválidos</span>
     <span class="chip" onclick="setFilter(this,'no_phone')">Sem Tel.</span>
     <button class="btn btn-s" onclick="refresh()">↻ Atualizar</button>
+    <button class="btn btn-g" id="pauseBtn" onclick="togglePause()">⏸️ Pausar</button>
   </div>
   <div class="count" id="leadCount"></div>
   <table>
@@ -101,7 +102,7 @@ const fmt = v => 'R$ ' + Number(v).toFixed(2).replace('.', ',').replace(/\B(?=(\
 const esc = s => { if(!s) return ''; const d=document.createElement('div'); d.textContent=s; return d.innerHTML; };
 const $ = id => document.getElementById(id);
 
-let phoneFilter = '', txPage = 1;
+let phoneFilter = '', txPage = 1, isPaused = false;
 
 function showTab(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('on'));
@@ -128,6 +129,8 @@ function toast(msg) {
 async function loadStats() {
   try {
     const s = await (await fetch('/api/stats')).json();
+    isPaused = s.paused || false;
+    updatePauseBtn();
     $('stats').innerHTML = `
       <div class="stat"><div class="stat-label">Transações</div><div class="stat-val b">${s.total}</div></div>
       <div class="stat"><div class="stat-label">Receita</div><div class="stat-val g">${fmt(s.revenue)}</div></div>
@@ -135,7 +138,7 @@ async function loadStats() {
       <div class="stat"><div class="stat-label">Tel. Válidos</div><div class="stat-val g">${s.telValid}</div></div>
       <div class="stat"><div class="stat-label">WhatsApp</div><div class="stat-val g">${s.telWa}</div></div>
       <div class="stat"><div class="stat-label">Enviados CRM</div><div class="stat-val g">${s.crmSent || 0}</div></div>
-      <div class="stat"><div class="stat-label">R$36,35 (auto)</div><div class="stat-val a">${s.autoTarget || 0}</div></div>
+      <div class="stat"><div class="stat-label">Auto-envio</div><div class="stat-val ${s.paused?'r':'g'}">${s.paused?'⏸️ PAUSADO':'▶️ ATIVO'}</div></div>
     `;
   } catch(e) {}
 }
@@ -154,7 +157,11 @@ async function loadLeads() {
       <td style="font-family:monospace;font-size:11px">${esc(l.documento)}</td>
       <td>${l.comprasPagas}/${l.compras}</td>
       <td style="color:var(--green);font-weight:600">${fmt(l.totalGasto)}</td>
-      <td>-</td>
+      <td>${l.sentCRM 
+        ? '<span class="tag tag-g">✓ Enviado</span>' 
+        : l.paidTxIds?.length 
+          ? `<button class="btn btn-g" style="padding:3px 8px;font-size:11px" onclick="sendCRM('${l.paidTxIds[l.paidTxIds.length-1]}')">📤 Enviar</button>` 
+          : '-'}</td>
     </tr>`).join('') || '<tr><td colspan="9" style="text-align:center;color:var(--dim);padding:40px">Nenhum lead encontrado</td></tr>';
   } catch(e) { console.error(e); }
 }
@@ -178,7 +185,7 @@ async function loadTxs() {
         <td style="font-size:12px">${esc(t.items?.[0]?.title||'-').substring(0,40)}</td>
         <td style="color:var(--green);font-weight:600">${fmt((t.amount||0)/100)}</td>
         <td><span class="tag ${st}">${stL}</span></td>
-        <td>${t.status==='paid'?`<button class="btn btn-s" style="padding:3px 8px;font-size:11px" onclick="sendCRM('${t.id}')">📤</button>`:''}</td>
+        <td>${t.status==='paid'?`<button class="btn btn-g" style="padding:4px 10px;font-size:11px" onclick="sendCRM('${t.id}')">📤 Enviar CRM</button>`:''}</td>
       </tr>`;
     }).join('');
   } catch(e) { console.error(e); }
@@ -197,7 +204,23 @@ async function sendCRM(id) {
     const j = await (await fetch(`/api/crm/send/${id}`, {method:'POST'})).json();
     if (j.success) toast('✓ Enviado ao CRM!');
     else toast('Erro: ' + (j.error || j.status || 'falha'));
+    loadAll();
   } catch(e) { toast('Erro: ' + e.message); }
+}
+
+async function togglePause() {
+  const endpoint = isPaused ? '/api/resume' : '/api/pause';
+  await fetch(endpoint, {method:'POST'});
+  isPaused = !isPaused;
+  updatePauseBtn();
+  toast(isPaused ? '⏸️ Envios pausados' : '▶️ Envios retomados');
+  loadStats();
+}
+
+function updatePauseBtn() {
+  const btn = $('pauseBtn');
+  if (isPaused) { btn.textContent = '▶️ Retomar'; btn.style.background = '#3b82f6'; }
+  else { btn.textContent = '⏸️ Pausar'; btn.style.background = 'var(--green)'; }
 }
 
 async function refresh() {

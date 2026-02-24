@@ -15,6 +15,7 @@ const PORT = process.env.PORT || 3005;
 let transactions = [];
 let logs = [];
 const sentIds = new Set(); // IDs já enviados ao CRM
+let autoPaused = false; // Pausar envios automáticos
 
 function log(msg) {
   const entry = { msg, time: new Date().toISOString() };
@@ -104,15 +105,18 @@ async function fetchLatest() {
       log(`✅ ${transactions.length} transações carregadas`);
       
       // Auto-enviar as pagas de R$36.35 com tel válido
-      const toSend = transactions.filter(t => t.status === 'paid' && t.amount === 3635 && !sentIds.has(t.id));
-      for (const tx of toSend) {
-        const tel = validarTelefone(tx.customer?.phone);
-        if (tel.valido) {
-          await autoSendCRM(tx);
-          await new Promise(r => setTimeout(r, 500)); // 500ms entre envios
+      if (!autoPaused) {
+        const toSend = transactions.filter(t => t.status === 'paid' && t.amount === 3635 && !sentIds.has(t.id));
+        for (const tx of toSend) {
+          if (autoPaused) break;
+          const tel = validarTelefone(tx.customer?.phone);
+          if (tel.valido) {
+            await autoSendCRM(tx);
+            await new Promise(r => setTimeout(r, 500));
+          }
         }
+        if (toSend.length > 0) log(`📤 ${sentIds.size} leads enviados automaticamente`);
       }
-      if (toSend.length > 0) log(`📤 ${sentIds.size} leads enviados automaticamente`);
     } else {
       // Só adicionar as novas
       const ids = new Set(transactions.map(t => t.id));
@@ -122,13 +126,16 @@ async function fetchLatest() {
         log(`🆕 ${brand.length} novas transações`);
         
         // AUTO-ENVIAR: pago + R$36.35 + telefone válido + ainda não enviado
-        for (const tx of brand) {
-          if (tx.status === 'paid' && tx.amount === 3635 && !sentIds.has(tx.id)) {
-            const tel = validarTelefone(tx.customer?.phone);
-            if (tel.valido) {
-              await autoSendCRM(tx);
-            } else {
-              log(`⚠️ ${tx.customer?.name || 'N/A'} — telefone inválido, não enviou`);
+        if (!autoPaused) {
+          for (const tx of brand) {
+            if (autoPaused) break;
+            if (tx.status === 'paid' && tx.amount === 3635 && !sentIds.has(tx.id)) {
+              const tel = validarTelefone(tx.customer?.phone);
+              if (tel.valido) {
+                await autoSendCRM(tx);
+              } else {
+                log(`⚠️ ${tx.customer?.name || 'N/A'} — telefone inválido, não enviou`);
+              }
             }
           }
         }
@@ -140,7 +147,7 @@ async function fetchLatest() {
           const oldStatus = ex.status;
           Object.assign(ex, nt);
           // Se mudou pra paid + R$36.35 + tel válido → enviar
-          if (nt.status === 'paid' && oldStatus !== 'paid' && nt.amount === 3635 && !sentIds.has(nt.id)) {
+          if (!autoPaused && nt.status === 'paid' && oldStatus !== 'paid' && nt.amount === 3635 && !sentIds.has(nt.id)) {
             const tel = validarTelefone(nt.customer?.phone);
             if (tel.valido) await autoSendCRM(nt);
           }
@@ -198,6 +205,7 @@ app.get('/api/stats', (req, res) => {
     telValid, telInvalid, telEmpty, telWa,
     crmSent: sentIds.size,
     autoTarget: paid.filter(t => t.amount === 3635).length,
+    paused: autoPaused,
   });
 });
 
@@ -229,6 +237,8 @@ app.get('/api/leads', (req, res) => {
         totalGasto: 0,
         ultimaCompra: t.createdAt,
         produtos: new Set(),
+        paidTxIds: [], // IDs das transações pagas deste lead
+        sentCRM: false,
       };
     }
     const l = map[key];
@@ -236,6 +246,8 @@ app.get('/api/leads', (req, res) => {
     if (t.status === 'paid') {
       l.comprasPagas++;
       l.totalGasto += (t.amount || 0) / 100;
+      l.paidTxIds.push(t.id);
+      if (sentIds.has(t.id)) l.sentCRM = true;
     }
     if (new Date(t.createdAt) > new Date(l.ultimaCompra)) l.ultimaCompra = t.createdAt;
     if (t.items?.[0]?.title) l.produtos.add(t.items[0].title.split(' - ')[0].trim());
@@ -361,6 +373,9 @@ app.post('/api/test-crm', async (req, res) => {
 });
 
 app.post('/api/refresh', async (req, res) => { await fetchLatest(); res.json({ ok: true, total: transactions.length }); });
+app.post('/api/pause', (req, res) => { autoPaused = true; log('⏸️ Envios automáticos PAUSADOS'); res.json({ paused: true }); });
+app.post('/api/resume', (req, res) => { autoPaused = false; log('▶️ Envios automáticos RETOMADOS'); res.json({ paused: false }); });
+app.get('/api/status', (req, res) => res.json({ paused: autoPaused, sent: sentIds.size }));
 app.get('/api/logs', (req, res) => res.json(logs));
 app.get('/health', (req, res) => res.json({ ok: true, transactions: transactions.length }));
 
