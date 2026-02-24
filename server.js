@@ -14,12 +14,52 @@ const PORT = process.env.PORT || 3005;
 
 let transactions = [];
 let logs = [];
+const sentIds = new Set(); // IDs já enviados ao CRM
 
 function log(msg) {
   const entry = { msg, time: new Date().toISOString() };
   console.log(msg);
   logs.unshift(entry);
   if (logs.length > 200) logs.length = 200;
+}
+
+// ══════ AUTO ENVIAR AO CRM ══════
+async function autoSendCRM(tx) {
+  const c = tx.customer || {};
+  const tel = validarTelefone(c.phone);
+  const name = c.name || 'N/A';
+  const valor = ((tx.amount || 0) / 100).toFixed(2);
+
+  try {
+    log(`🚀 AUTO-CRM ← ${name} | ${tel.formatado} | R$ ${valor}`);
+    const r = await fetch(CRM, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'venda_paga',
+        lead: {
+          nome: c.name || '', email: c.email || '',
+          telefone: tel.formatado || c.phone || '',
+          telefone_valido: tel.valido, whatsapp: tel.whatsapp || '',
+          documento: c.document?.number || '',
+        },
+        transacao: {
+          id: tx.id, valor: (tx.amount || 0) / 100,
+          produto: tx.items?.[0]?.title || '',
+          metodo: tx.paymentMethod || '', status: tx.status, data: tx.createdAt,
+        },
+      }),
+    });
+    const text = await r.text().catch(() => '');
+    if (r.ok) {
+      sentIds.add(tx.id);
+      log(`✅ AUTO-CRM ✓ ${name} — R$ ${valor} — ${tel.formatado}`);
+    } else {
+      log(`❌ AUTO-CRM erro ${r.status}: ${text.substring(0, 150)}`);
+    }
+  } catch (e) {
+    log(`❌ AUTO-CRM falhou: ${e.message}`);
+  }
 }
 
 // ══════ VALIDAR TELEFONE BR ══════
@@ -62,6 +102,17 @@ async function fetchLatest() {
       // Primeira vez — pegar as últimas 500
       transactions = newTxs;
       log(`✅ ${transactions.length} transações carregadas`);
+      
+      // Auto-enviar as pagas de R$36.35 com tel válido
+      const toSend = transactions.filter(t => t.status === 'paid' && t.amount === 3635 && !sentIds.has(t.id));
+      for (const tx of toSend) {
+        const tel = validarTelefone(tx.customer?.phone);
+        if (tel.valido) {
+          await autoSendCRM(tx);
+          await new Promise(r => setTimeout(r, 500)); // 500ms entre envios
+        }
+      }
+      if (toSend.length > 0) log(`📤 ${sentIds.size} leads enviados automaticamente`);
     } else {
       // Só adicionar as novas
       const ids = new Set(transactions.map(t => t.id));
@@ -69,11 +120,31 @@ async function fetchLatest() {
       if (brand.length > 0) {
         transactions = [...brand, ...transactions];
         log(`🆕 ${brand.length} novas transações`);
+        
+        // AUTO-ENVIAR: pago + R$36.35 + telefone válido + ainda não enviado
+        for (const tx of brand) {
+          if (tx.status === 'paid' && tx.amount === 3635 && !sentIds.has(tx.id)) {
+            const tel = validarTelefone(tx.customer?.phone);
+            if (tel.valido) {
+              await autoSendCRM(tx);
+            } else {
+              log(`⚠️ ${tx.customer?.name || 'N/A'} — telefone inválido, não enviou`);
+            }
+          }
+        }
       }
-      // Atualizar status das existentes
+      // Atualizar status das existentes (ex: pending → paid)
       for (const nt of newTxs) {
         const ex = transactions.find(t => t.id === nt.id);
-        if (ex && ex.status !== nt.status) Object.assign(ex, nt);
+        if (ex && ex.status !== nt.status) {
+          const oldStatus = ex.status;
+          Object.assign(ex, nt);
+          // Se mudou pra paid + R$36.35 + tel válido → enviar
+          if (nt.status === 'paid' && oldStatus !== 'paid' && nt.amount === 3635 && !sentIds.has(nt.id)) {
+            const tel = validarTelefone(nt.customer?.phone);
+            if (tel.valido) await autoSendCRM(nt);
+          }
+        }
       }
     }
   } catch (e) {
@@ -125,6 +196,8 @@ app.get('/api/stats', (req, res) => {
     revenue: paid.reduce((s, t) => s + (t.amount || 0), 0) / 100,
     leads: leads.size,
     telValid, telInvalid, telEmpty, telWa,
+    crmSent: sentIds.size,
+    autoTarget: paid.filter(t => t.amount === 3635).length,
   });
 });
 
@@ -244,6 +317,7 @@ app.post('/api/crm/send/:id', async (req, res) => {
     });
     const text = await r.text().catch(() => '');
     log(`CRM resposta: ${r.status} ${text.substring(0, 200)}`);
+    if (r.ok) sentIds.add(tx.id);
     res.json({ success: r.ok, status: r.status, response: text.substring(0, 200) });
   } catch (e) {
     log(`❌ CRM erro: ${e.message}`);
@@ -298,6 +372,7 @@ app.get('*', (req, res) => {
 // ══════ START ══════
 app.listen(PORT, () => {
   console.log(`⚡ DHR Leads → http://localhost:${PORT}`);
+  console.log(`🤖 Auto-CRM: pago + R$36.35 + tel válido`);
   console.log(`📍 Debug: http://localhost:${PORT}/api/debug`);
 });
 

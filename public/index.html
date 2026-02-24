@@ -134,8 +134,8 @@ async function loadStats() {
       <div class="stat"><div class="stat-label">Leads</div><div class="stat-val b">${s.leads}</div></div>
       <div class="stat"><div class="stat-label">Tel. Válidos</div><div class="stat-val g">${s.telValid}</div></div>
       <div class="stat"><div class="stat-label">WhatsApp</div><div class="stat-val g">${s.telWa}</div></div>
-      <div class="stat"><div class="stat-label">Tel. Inválidos</div><div class="stat-val r">${s.telInvalid}</div></div>
-      <div class="stat"><div class="stat-label">Sem Telefone</div><div class="stat-val a">${s.telEmpty}</div></div>
+      <div class="stat"><div class="stat-label">Enviados CRM</div><div class="stat-val g">${s.crmSent || 0}</div></div>
+      <div class="stat"><div class="stat-label">R$36,35 (auto)</div><div class="stat-val a">${s.autoTarget || 0}</div></div>
     `;
   } catch(e) {}
 }
